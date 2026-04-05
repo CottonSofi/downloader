@@ -34,6 +34,12 @@ UI_TEXTS = {
     "load_info": "Cargar info",
     "pick_folder": "Elegir carpeta",
     "best": "BEST (audio+video)",
+    "video_quality": "Calidad video:",
+    "audio_quality": "Calidad audio:",
+    "audio_only": "Solo audio",
+    "video_only": "Solo video",
+    "restart_app": "Reiniciar app",
+    "start_with_windows": "Iniciar con Windows",
     "stop_feed": "STOP Feed",
     "live_log": "Ver log en vivo",
     "ig_info": "Info Instagram",
@@ -59,6 +65,12 @@ UI_TEXTS = {
     "load_info": "Load info",
     "pick_folder": "Choose folder",
     "best": "BEST (audio+video)",
+    "video_quality": "Video quality:",
+    "audio_quality": "Audio quality:",
+    "audio_only": "Audio only",
+    "video_only": "Video only",
+    "restart_app": "Restart app",
+    "start_with_windows": "Start with Windows",
     "stop_feed": "STOP Feed",
     "live_log": "Live log",
     "ig_info": "Instagram info",
@@ -133,6 +145,7 @@ class DownloaderApp:
     self.video_info = None
     self.available_languages = ["auto"]
     self.available_qualities = ["best"]
+    self.available_audio_qualities = ["best audio"]
     self.available_subtitle_languages = ["auto", "all", "es", "en", "es.*", "en.*"]
     self.available_audio_languages = {"auto"}
     self.available_caption_languages = set()
@@ -164,13 +177,16 @@ class DownloaderApp:
     self.duration_var = tk.StringVar(value="Duracion: -")
     self.selected_language_var = tk.StringVar(value="auto")
     self.selected_quality_var = tk.StringVar(value="best")
+    self.selected_audio_quality_var = tk.StringVar(value="best audio")
     self.include_subtitles_var = tk.BooleanVar(value=False)
     self.embed_subtitles_var = tk.BooleanVar(value=True)
+    self.audio_only_var = tk.BooleanVar(value=False)
     self.subtitle_lang_var = tk.StringVar(value="auto")
     self.compression_var = tk.StringVar(value="sin_compresion")
     self.use_cookies_var = tk.BooleanVar(value=False)
     self.cookies_browser_var = tk.StringVar(value="chrome")
     self.cookies_file_var = tk.StringVar(value="")
+    self.start_with_windows_var = tk.BooleanVar(value=False)
     self.feed_image_seconds_var = tk.StringVar(value="10")
     self.feed_scroll_pause_var = tk.StringVar(value="1.5")
     self.feed_scroll_px_var = tk.StringVar(value="900")
@@ -202,6 +218,7 @@ class DownloaderApp:
     self.clipboard_seen_urls: set[str] = set()
     self.clipboard_pending_url: str | None = None
 
+    self._load_start_with_windows_state()
     self._build_ui()
     self._prepare_log_file()
     self._auto_load_default_cookies_file()
@@ -222,6 +239,63 @@ class DownloaderApp:
   def _tr(self, key: str, default: str) -> str:
     lang = (self.ui_language_var.get() or "es").strip().lower()
     return UI_TEXTS.get(lang, UI_TEXTS["es"]).get(key, default)
+
+  def _startup_cmd_path(self) -> str:
+    appdata = os.environ.get("APPDATA", "").strip()
+    startup_dir = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
+    app_name = os.path.splitext(os.path.basename(__file__))[0]
+    return os.path.join(startup_dir, f"{app_name}_autostart.cmd")
+
+  def _load_start_with_windows_state(self) -> None:
+    try:
+      self.start_with_windows_var.set(os.path.isfile(self._startup_cmd_path()))
+    except Exception:
+      self.start_with_windows_var.set(False)
+
+  def _set_start_with_windows_enabled(self, enabled: bool) -> None:
+    startup_cmd = self._startup_cmd_path()
+    startup_dir = os.path.dirname(startup_cmd)
+
+    if enabled:
+      os.makedirs(startup_dir, exist_ok=True)
+      script_path = os.path.abspath(__file__)
+      script_dir = os.path.dirname(script_path)
+      content = (
+        "@echo off\n"
+        f"cd /d \"{script_dir}\"\n"
+        f"\"{sys.executable}\" \"{script_path}\"\n"
+      )
+      with open(startup_cmd, "w", encoding="utf-8", errors="replace") as f:
+        f.write(content)
+      return
+
+    if os.path.isfile(startup_cmd):
+      os.remove(startup_cmd)
+
+  def _on_start_with_windows_toggle(self) -> None:
+    enabled = bool(self.start_with_windows_var.get())
+    try:
+      self._set_start_with_windows_enabled(enabled)
+      if enabled:
+        self.log("Inicio con Windows: activado")
+      else:
+        self.log("Inicio con Windows: desactivado")
+    except Exception as exc:
+      self.start_with_windows_var.set(not enabled)
+      messagebox.showerror(APP_TITLE, f"No se pudo actualizar inicio con Windows: {exc}")
+
+  def restart_application(self) -> None:
+    try:
+      script_path = os.path.abspath(__file__)
+      subprocess.Popen(
+        [sys.executable, script_path],
+        cwd=os.path.dirname(script_path),
+        creationflags=CREATE_NO_WINDOW,
+      )
+      self.log("Reiniciando aplicacion...")
+      self.root.after(150, self.root.destroy)
+    except Exception as exc:
+      messagebox.showerror(APP_TITLE, f"No se pudo reiniciar la aplicacion: {exc}")
 
   def _on_ui_language_change(self, _event=None) -> None:
     try:
@@ -1606,7 +1680,7 @@ class DownloaderApp:
     )
     self.language_combo.grid(row=2, column=1, sticky="w", padx=8, pady=6)
 
-    ttk.Label(cfg, text="Calidad:").grid(row=2, column=2, sticky="e", padx=8, pady=6)
+    ttk.Label(cfg, text=self._tr("video_quality", "Calidad video:")).grid(row=2, column=2, sticky="e", padx=8, pady=6)
     self.quality_combo = ttk.Combobox(
       cfg,
       textvariable=self.selected_quality_var,
@@ -1616,7 +1690,23 @@ class DownloaderApp:
     )
     self.quality_combo.grid(row=2, column=3, sticky="w", padx=8, pady=6)
 
-    ttk.Label(cfg, textvariable=self.duration_var).grid(row=2, column=4, sticky="w", padx=8, pady=6)
+    ttk.Label(cfg, text=self._tr("audio_quality", "Calidad audio:")).grid(row=2, column=4, sticky="e", padx=8, pady=6)
+    self.audio_quality_combo = ttk.Combobox(
+      cfg,
+      textvariable=self.selected_audio_quality_var,
+      values=self.available_audio_qualities,
+      state="readonly",
+      width=14,
+    )
+    self.audio_quality_combo.grid(row=2, column=5, sticky="w", padx=8, pady=6)
+
+    ttk.Checkbutton(
+      cfg,
+      text=self._tr("audio_only", "Solo audio"),
+      variable=self.audio_only_var,
+    ).grid(row=2, column=6, sticky="w", padx=8, pady=6)
+
+    ttk.Label(cfg, textvariable=self.duration_var).grid(row=2, column=7, sticky="w", padx=8, pady=6)
 
     ttk.Label(cfg, text="Compresion:").grid(row=3, column=0, sticky="w", padx=8, pady=6)
     ttk.Combobox(
@@ -1673,12 +1763,27 @@ class DownloaderApp:
     ttk.Button(actions, text=self._tr("best", "BEST (audio+video)"), command=self.download_best).pack(
       side="left", padx=8, pady=10
     )
+    ttk.Button(actions, text=self._tr("audio_only", "Solo audio"), command=self.download_audio_only).pack(
+      side="left", padx=8, pady=10
+    )
+    ttk.Button(actions, text=self._tr("video_only", "Solo video"), command=self.download_video_only).pack(
+      side="left", padx=8, pady=10
+    )
     ttk.Button(actions, text="Limitar tamano", command=self.download_limited_size).pack(
       side="left", padx=8, pady=10
     )
     ttk.Button(actions, text="Recortar segmento", command=self.download_trimmed).pack(
       side="left", padx=8, pady=10
     )
+    ttk.Button(actions, text=self._tr("restart_app", "Reiniciar app"), command=self.restart_application).pack(
+      side="left", padx=8, pady=10
+    )
+    ttk.Checkbutton(
+      actions,
+      text=self._tr("start_with_windows", "Iniciar con Windows"),
+      variable=self.start_with_windows_var,
+      command=self._on_start_with_windows_toggle,
+    ).pack(side="left", padx=10, pady=10)
     ttk.Checkbutton(
       actions,
       text=self._tr("clipboard_monitor", "Monitor portapapeles (auto)"),
@@ -2688,6 +2793,7 @@ class DownloaderApp:
       self.log(f"Idiomas de audio: {', '.join(sorted(audio))}")
       self.log(f"Idiomas de subtitulos/captions: {', '.join(sorted(captions))}")
       self.log(f"Calidades detectadas: {', '.join(self._collect_video_qualities(info))}")
+      self.log(f"Calidades de audio detectadas: {', '.join(self._collect_audio_qualities(info))}")
 
     self._run_background(task, f"CARGAR INFO {source_label.upper()}")
 
@@ -2954,6 +3060,21 @@ class DownloaderApp:
       return ["best"]
     return ["best", *[f"{height}p" for height in sorted_heights]]
 
+  def _collect_audio_qualities(self, info: dict) -> list[str]:
+    bitrates: set[int] = set()
+    for fmt in info.get("formats", []) or []:
+      acodec = fmt.get("acodec")
+      if not acodec or acodec == "none":
+        continue
+
+      abr = fmt.get("abr")
+      if isinstance(abr, (int, float)) and abr > 0:
+        bitrates.add(int(round(float(abr))))
+
+    values = [f"{kbps}k" for kbps in sorted(bitrates, reverse=True)]
+    values.append("best audio")
+    return values
+
   def _update_language_selector(self, info: dict) -> None:
     merged, audio, captions = self._collect_all_languages(info)
     self.available_languages = merged
@@ -2968,6 +3089,11 @@ class DownloaderApp:
     self.quality_combo.configure(values=self.available_qualities)
     if self.selected_quality_var.get() not in self.available_qualities:
       self.selected_quality_var.set("best")
+
+    self.available_audio_qualities = self._collect_audio_qualities(info)
+    self.audio_quality_combo.configure(values=self.available_audio_qualities)
+    if self.selected_audio_quality_var.get() not in self.available_audio_qualities:
+      self.selected_audio_quality_var.set("best audio")
 
     self.available_subtitle_languages = self._collect_subtitle_selector_values(captions)
     self.subtitle_combo.configure(values=self.available_subtitle_languages)
@@ -2990,6 +3116,29 @@ class DownloaderApp:
     if quality.endswith("p") and quality[:-1].isdigit():
       return int(quality[:-1])
     return None
+
+  def _selected_audio_bitrate(self) -> int | None:
+    quality = (self.selected_audio_quality_var.get() or "best audio").strip().lower()
+    if quality in {"best", "best audio", "bestaudio"}:
+      return None
+    match = re.match(r"^(\d+)\s*k$", quality)
+    if match:
+      return int(match.group(1))
+    if quality.isdigit():
+      return int(quality)
+    return None
+
+  def _audio_only_format_selector(self) -> str:
+    bitrate = self._selected_audio_bitrate()
+    if bitrate is None:
+      return "bestaudio"
+    return f"ba[abr<={bitrate}]/bestaudio"
+
+  def _video_only_format_selector(self) -> str:
+    target_height = self._selected_quality_height()
+    if target_height is None:
+      return "bestvideo/bv*"
+    return f"bv*[height<={target_height}]/bestvideo[height<={target_height}]/bv*"
 
   def _compression_postprocessor_args(self) -> str | None:
     mode = (self.compression_var.get() or "sin_compresion").strip().lower()
@@ -3100,6 +3249,9 @@ class DownloaderApp:
     )
 
   def download_best(self) -> None:
+    if self.audio_only_var.get():
+      self.download_audio_only()
+      return
     try:
       self._ensure_not_running()
       url = self._safe_url()
@@ -3107,6 +3259,50 @@ class DownloaderApp:
       messagebox.showerror(APP_TITLE, str(exc))
       return
     self._download_best_for_url(url, "General")
+
+  def download_audio_only(self) -> None:
+    try:
+      self._ensure_not_running()
+      url = self._safe_url()
+    except Exception as exc:
+      messagebox.showerror(APP_TITLE, str(exc))
+      return
+
+    out = self._build_output_template(url)
+
+    def task() -> None:
+      specific_args = [
+        "-f",
+        self._audio_only_format_selector(),
+        "-o",
+        out,
+      ]
+      self.log(f"Modo SOLO AUDIO: calidad={self.selected_audio_quality_var.get()}")
+      self._run_yt_dlp_download(url, specific_args, allow_social_fallback=self._is_social_media_url(url))
+
+    self._run_background(task, "DESCARGA SOLO AUDIO")
+
+  def download_video_only(self) -> None:
+    try:
+      self._ensure_not_running()
+      url = self._safe_url()
+    except Exception as exc:
+      messagebox.showerror(APP_TITLE, str(exc))
+      return
+
+    out = self._build_output_template(url)
+
+    def task() -> None:
+      specific_args = [
+        "-f",
+        self._video_only_format_selector(),
+        "-o",
+        out,
+      ]
+      self.log(f"Modo SOLO VIDEO: calidad={self.selected_quality_var.get()}")
+      self._run_yt_dlp_download(url, specific_args, allow_social_fallback=self._is_social_media_url(url))
+
+    self._run_background(task, "DESCARGA SOLO VIDEO")
 
   def _resolve_full_duration(self) -> int:
     if not self.video_info:
