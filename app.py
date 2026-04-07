@@ -220,10 +220,12 @@ class DownloaderApp:
     self.clipboard_seen_urls: set[str] = set()
     self.clipboard_pending_url: str | None = None
     self.monitors: list[dict] = self._detect_monitors()
+    self._last_monitors_signature: tuple = tuple(self._monitor_identity(m) for m in self.monitors)
     self.twitter_instances: dict[int, dict] = {}
     self.twitter_instance_seq = 1
     self.twitter_instances_lock = threading.Lock()
     self.twitter_monitor_cookie_choice: dict[int, str] = {}
+    self.twitter_global_cookie_choice = tk.StringVar(value="")
     self.x_instances_panel: ttk.LabelFrame | None = None
     self.x_instances_table: ttk.Frame | None = None
     self.x_instances_hint_var = tk.StringVar(value="")
@@ -413,6 +415,46 @@ class DownloaderApp:
         return monitor
     return None
 
+  def _monitor_identity(self, monitor: dict) -> tuple:
+    return (
+      str(monitor.get("device") or "").strip().lower(),
+      int(monitor.get("left", 0)),
+      int(monitor.get("top", 0)),
+      int(monitor.get("width", 0)),
+      int(monitor.get("height", 0)),
+    )
+
+  def _refresh_monitors_if_changed(self) -> bool:
+    try:
+      detected = self._detect_monitors()
+    except Exception:
+      return False
+
+    new_signature = tuple(self._monitor_identity(item) for item in detected)
+    if new_signature == self._last_monitors_signature:
+      return False
+
+    old_cookie_by_identity: dict[tuple, str] = {}
+    for old_monitor in self.monitors:
+      old_id = int(old_monitor.get("id", 0))
+      if old_id in self.twitter_monitor_cookie_choice:
+        old_cookie_by_identity[self._monitor_identity(old_monitor)] = (
+          self.twitter_monitor_cookie_choice.get(old_id, "") or ""
+        ).strip()
+
+    self.monitors = detected
+    remapped_choices: dict[int, str] = {}
+    for monitor in self.monitors:
+      match = old_cookie_by_identity.get(self._monitor_identity(monitor), "")
+      if match or self._monitor_identity(monitor) in old_cookie_by_identity:
+        remapped_choices[int(monitor.get("id", 0))] = match
+    self.twitter_monitor_cookie_choice = remapped_choices
+
+    self._last_monitors_signature = new_signature
+    self.x_instances_signature = None
+    self.log(f"Monitores actualizados: {len(self.monitors)} detectado(s)")
+    return True
+
   def _cookie_pool_default_dir(self) -> str:
     base_dir = os.path.dirname(os.path.dirname(__file__))
     candidates = [
@@ -482,6 +524,10 @@ class DownloaderApp:
 
     menu = tk.Menu(self.root, tearoff=0)
     menu.add_command(
+      label="Seleccionar: usar cookie global",
+      command=lambda: self._clear_monitor_cookie_choice(monitor_id),
+    )
+    menu.add_command(
       label="Seleccionar: sin cookies",
       command=lambda: self._set_monitor_cookie_choice(monitor_id, ""),
     )
@@ -507,8 +553,78 @@ class DownloaderApp:
     self.twitter_monitor_cookie_choice[int(monitor_id)] = (cookie_file or "").strip()
     self._refresh_x_instances_ui()
 
+  def _clear_monitor_cookie_choice(self, monitor_id: int) -> None:
+    self.twitter_monitor_cookie_choice.pop(int(monitor_id), None)
+    self._refresh_x_instances_ui()
+
+  def _set_global_cookie_choice(self, cookie_file: str) -> None:
+    self.twitter_global_cookie_choice.set((cookie_file or "").strip())
+    self._refresh_x_instances_ui()
+
+  def _selected_global_cookie(self) -> str:
+    return (self.twitter_global_cookie_choice.get() or "").strip()
+
   def _selected_cookie_for_monitor(self, monitor_id: int) -> str:
-    return (self.twitter_monitor_cookie_choice.get(int(monitor_id), "") or "").strip()
+    monitor_key = int(monitor_id)
+    if monitor_key in self.twitter_monitor_cookie_choice:
+      return (self.twitter_monitor_cookie_choice.get(monitor_key, "") or "").strip()
+    return self._selected_global_cookie()
+
+  def _monitor_cookie_display(self, monitor_id: int) -> str:
+    monitor_key = int(monitor_id)
+    if monitor_key in self.twitter_monitor_cookie_choice:
+      selected = (self.twitter_monitor_cookie_choice.get(monitor_key, "") or "").strip()
+      return self._cookie_label(selected)
+    selected_global = self._selected_global_cookie()
+    if selected_global:
+      return f"{self._cookie_label(selected_global)} [global]"
+    return self._cookie_label("")
+
+  def _choose_global_cookie(self) -> None:
+    initial_dir = (self.cookies_folder_var.get() or "").strip() or self._cookie_pool_default_dir()
+    selected = filedialog.askopenfilename(
+      title="Selecciona cookie global para instancias X",
+      initialdir=initial_dir,
+      filetypes=[("Cookies", "*.txt *.json"), ("Todos", "*.*")],
+    )
+    if selected:
+      self._set_global_cookie_choice(selected)
+      self.log(f"Cookie global X: {self._cookie_label(selected)}")
+
+  def _apply_global_cookie_to_all_monitors(self) -> None:
+    selected_global = self._selected_global_cookie()
+    for monitor in self.monitors:
+      self.twitter_monitor_cookie_choice[int(monitor.get("id", 0))] = selected_global
+    self._refresh_x_instances_ui()
+    self.log(
+      "Cookie global aplicada a todos los monitores"
+      if selected_global
+      else "Se aplico sin cookies a todos los monitores"
+    )
+
+  def _open_global_cookie_menu(self, anchor_widget) -> None:
+    menu = tk.Menu(self.root, tearoff=0)
+    menu.add_command(
+      label="Seleccionar global: sin cookies",
+      command=lambda: self._set_global_cookie_choice(""),
+    )
+    pool = self._cookie_pool_files()
+    if pool:
+      menu.add_separator()
+      for cookie_file in pool:
+        menu.add_command(
+          label=f"Seleccionar global: {self._cookie_label(cookie_file)}",
+          command=lambda chosen=cookie_file: self._set_global_cookie_choice(chosen),
+        )
+    menu.add_separator()
+    menu.add_command(label="Elegir cookie global manualmente...", command=self._choose_global_cookie)
+
+    x = anchor_widget.winfo_rootx()
+    y = anchor_widget.winfo_rooty() + anchor_widget.winfo_height()
+    try:
+      menu.tk_popup(x, y)
+    finally:
+      menu.grab_release()
 
   def _choose_cookie_for_monitor(self, monitor_id: int) -> None:
     initial_dir = (self.cookies_folder_var.get() or "").strip() or self._cookie_pool_default_dir()
@@ -616,6 +732,28 @@ class DownloaderApp:
       scraper.request_skip()
       self.log(f"Skip solicitado para {item.get('name')}")
 
+  def _like_instance_current_post(self, instance_id: int) -> None:
+    item = self._get_instance_item(instance_id)
+    if not item:
+      return
+    scraper = item.get("scraper")
+    if not scraper:
+      return
+    ok = scraper.request_like_current_twitter_post()
+    if not ok:
+      self.log(f"Like no disponible para {item.get('name')} (instancia no activa)")
+
+  def _retweet_instance_current_post(self, instance_id: int) -> None:
+    item = self._get_instance_item(instance_id)
+    if not item:
+      return
+    scraper = item.get("scraper")
+    if not scraper:
+      return
+    ok = scraper.request_retweet_current_twitter_post()
+    if not ok:
+      self.log(f"Retweet no disponible para {item.get('name')} (instancia no activa)")
+
   def _stop_instance(self, instance_id: int) -> None:
     with self.twitter_instances_lock:
       item = self.twitter_instances.pop(int(instance_id), None)
@@ -710,6 +848,7 @@ class DownloaderApp:
 
   def _refresh_x_instances_ui_tick(self) -> None:
     try:
+      self._refresh_monitors_if_changed()
       self._prune_dead_twitter_instances()
       self._refresh_x_instances_ui()
     finally:
@@ -729,10 +868,11 @@ class DownloaderApp:
     monitor_cookie_signature = tuple(
       (
         int(monitor.get("id", 0)),
-        self._selected_cookie_for_monitor(int(monitor.get("id", 0))),
+        (self.twitter_monitor_cookie_choice.get(int(monitor.get("id", 0)), "") or "").strip(),
       )
       for monitor in self.monitors
     )
+    global_cookie_signature = self._selected_global_cookie()
     pool_count = len(self._cookie_pool_files())
 
     items_signature = tuple(
@@ -747,7 +887,7 @@ class DownloaderApp:
       )
       for item in items
     )
-    signature = (monitor_cookie_signature, pool_count, items_signature)
+    signature = (monitor_cookie_signature, global_cookie_signature, pool_count, items_signature)
 
     if not panel.winfo_manager():
       if self.log_frame_widget is not None:
@@ -776,14 +916,33 @@ class DownloaderApp:
       foreground="#475569",
     ).pack(side="right")
 
+    global_cookie_row = ttk.Frame(table)
+    global_cookie_row.pack(fill="x", pady=(0, 8))
+    global_cookie_text = self._cookie_label(self._selected_global_cookie())
+    ttk.Label(global_cookie_row, text=f"Cookie global: {global_cookie_text}", foreground="#475569").pack(side="left", padx=(0, 8))
+    global_trigger = ttk.Button(
+      global_cookie_row,
+      text="☰",
+      style="Subtle.TButton",
+      width=3,
+      command=lambda: None,
+    )
+    global_trigger.configure(command=lambda btn=global_trigger: self._open_global_cookie_menu(btn))
+    global_trigger.pack(side="left", padx=(0, 6))
+    ttk.Button(
+      global_cookie_row,
+      text="Aplicar global a monitores",
+      style="Subtle.TButton",
+      command=self._apply_global_cookie_to_all_monitors,
+    ).pack(side="left")
+
     monitors_box = ttk.Frame(table)
     monitors_box.pack(fill="x", pady=(0, 10))
     for monitor in self.monitors:
       row = ttk.Frame(monitors_box)
       row.pack(fill="x", pady=2)
       monitor_id = int(monitor.get("id", 0))
-      selected_cookie = self._selected_cookie_for_monitor(monitor_id)
-      cookie_text = self._cookie_label(selected_cookie)
+      cookie_text = self._monitor_cookie_display(monitor_id)
 
       ttk.Label(row, text=str(monitor.get("label") or "Monitor")).pack(side="left", padx=(0, 8))
       ttk.Label(row, text=f"Cookie seleccionada: {cookie_text}", foreground="#475569").pack(side="left", padx=(0, 8))
@@ -844,6 +1003,8 @@ class DownloaderApp:
       ttk.Button(controls, text=pause_text, style="Subtle.TButton", command=lambda iid=instance_id: self._pause_resume_instance(iid)).pack(side="left", padx=2)
       ttk.Button(controls, text=mute_text, style="Subtle.TButton", command=lambda iid=instance_id: self._toggle_mute_instance(iid)).pack(side="left", padx=2)
       ttk.Button(controls, text=screen_text, style="Subtle.TButton", command=lambda iid=instance_id: self._set_instance_fullscreen(iid)).pack(side="left", padx=2)
+      ttk.Button(controls, text="Like", style="Subtle.TButton", command=lambda iid=instance_id: self._like_instance_current_post(iid)).pack(side="left", padx=2)
+      ttk.Button(controls, text="Retweet", style="Subtle.TButton", command=lambda iid=instance_id: self._retweet_instance_current_post(iid)).pack(side="left", padx=2)
       ttk.Button(controls, text="Skip", style="Subtle.TButton", command=lambda iid=instance_id: self._skip_instance(iid)).pack(side="left", padx=2)
       ttk.Button(controls, text="Detener", style="Danger.TButton", command=lambda iid=instance_id: self._stop_instance(iid)).pack(side="left", padx=2)
       ttk.Button(controls, text="Kill", style="Danger.TButton", command=lambda iid=instance_id: self._kill_instance(iid)).pack(side="left", padx=2)
@@ -2906,6 +3067,8 @@ class DownloaderApp:
       return
 
     self.cookies_file_var.set(candidates[0])
+    if not self._selected_global_cookie():
+      self._set_global_cookie_choice(candidates[0])
     self.log(f"cookies detectadas automaticamente: principal={candidates[0]}")
     if len(candidates) > 1:
       self.log(f"cookies alterna detectada: {candidates[1]}")

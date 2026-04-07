@@ -65,11 +65,14 @@ class FeedScraper:
     self._pause_event = threading.Event()
     self._skip_event = threading.Event()
     self._kill_event = threading.Event()
+    self._action_like_event = threading.Event()
+    self._action_retweet_event = threading.Event()
     self._state_lock = threading.Lock()
     self._muted = False
     self._window_fullscreen = False
     self._pending_window_state: bool | None = None
     self._last_home_guard_log_ts = 0.0
+    self._twitter_focus_status_id = ""
     self._runtime_context = None
     self._runtime_page = None
     self._last_error_summary = ""
@@ -148,9 +151,26 @@ class FeedScraper:
   def request_skip(self) -> None:
     self._skip_event.set()
 
+  def request_like_current_twitter_post(self) -> bool:
+    if not self.is_running():
+      return False
+    self._action_like_event.set()
+    self._log("Accion solicitada: Like al post actual")
+    return True
+
+  def request_retweet_current_twitter_post(self) -> bool:
+    if not self.is_running():
+      return False
+    self._action_retweet_event.set()
+    self._log("Accion solicitada: Retweet al post actual")
+    return True
+
   def kill(self) -> None:
     self._kill_event.set()
     self._stop_event.set()
+    self._action_like_event.clear()
+    self._action_retweet_event.clear()
+    self._twitter_focus_status_id = ""
     try:
       if self._runtime_context is not None:
         self._runtime_context.close()
@@ -191,6 +211,9 @@ class FeedScraper:
     self._kill_event.clear()
     self._skip_event.clear()
     self._pause_event.clear()
+    self._action_like_event.clear()
+    self._action_retweet_event.clear()
+    self._twitter_focus_status_id = ""
     selected = Platform.parse(platform)
     self._thread = threading.Thread(target=self._run, args=(selected,), daemon=True)
     self._thread.start()
@@ -198,6 +221,9 @@ class FeedScraper:
   def stop(self) -> None:
     self._stop_event.set()
     self._skip_event.set()
+    self._action_like_event.clear()
+    self._action_retweet_event.clear()
+    self._twitter_focus_status_id = ""
     if self._thread and self._thread.is_alive():
       self._thread.join(timeout=5)
 
@@ -234,8 +260,234 @@ class FeedScraper:
           self._sync_page_mute_state(page)
         except Exception:
           pass
+        try:
+          self._drain_pending_user_actions(page)
+        except Exception:
+          pass
       time.sleep(0.12)
     return "done"
+
+  def _drain_pending_user_actions(self, page) -> None:
+    if self._action_like_event.is_set():
+      self._action_like_event.clear()
+      self._like_current_twitter_post(page)
+
+    if self._action_retweet_event.is_set():
+      self._action_retweet_event.clear()
+      self._retweet_current_twitter_post(page)
+
+  def _status_id_from_url(self, value: str) -> str:
+    clean = str(value or "").strip()
+    if not clean:
+      return ""
+    match = re.search(r"/status/(\d+)", clean, flags=re.IGNORECASE)
+    if not match:
+      return ""
+    return str(match.group(1) or "").strip()
+
+  def _resolve_action_target_status_id(self, page) -> str:
+    page_url = ""
+    try:
+      page_url = str(page.url or "").strip()
+    except Exception:
+      page_url = ""
+
+    from_page = self._status_id_from_url(page_url)
+    if from_page:
+      return from_page
+
+    from_focus = self._status_id_from_url(self._twitter_focus_status_id)
+    if from_focus:
+      return from_focus
+
+    return ""
+
+  def _like_current_twitter_post(self, page) -> None:
+    target_status_id = self._resolve_action_target_status_id(page)
+    if not target_status_id:
+      self._log("Accion Like: no se pudo resolver tweet objetivo")
+      return
+
+    result = page.evaluate(
+      """
+      (targetStatusId) => {
+        const vh = window.innerHeight || document.documentElement.clientHeight;
+        const normalizedTarget = String(targetStatusId || '').trim();
+        if (!normalizedTarget) return { ok: false, reason: 'no-target-status-id' };
+
+        const statusIdFrom = (href) => {
+          const m = String(href || '').match(/\/status\/(\d+)/i);
+          return m ? String(m[1]) : '';
+        };
+
+        const articles = Array.from(document.querySelectorAll('article'));
+        let target = null;
+        let best = Number.POSITIVE_INFINITY;
+
+        for (const article of articles) {
+          const links = Array.from(article.querySelectorAll('a[href*="/status/"]'));
+          if (!links.length) continue;
+          const matchesTarget = links.some((a) => statusIdFrom(a.href || a.getAttribute('href') || '') === normalizedTarget);
+          if (!matchesTarget) continue;
+
+          const hasActionBar = Boolean(
+            article.querySelector('[data-testid="like"], [data-testid="unlike"], [data-testid="retweet"], [data-testid="unretweet"]')
+          );
+          if (!hasActionBar) continue;
+
+          const rect = article.getBoundingClientRect();
+          if (rect.bottom <= 0 || rect.top >= vh) continue;
+          const centerDelta = Math.abs((rect.top + rect.height / 2) - (vh / 2));
+          if (centerDelta < best) {
+            best = centerDelta;
+            target = article;
+          }
+        }
+
+        if (!target) return { ok: false, reason: 'no-target' };
+
+        const alreadyLiked = target.querySelector('[data-testid="unlike"]');
+        if (alreadyLiked) return { ok: true, state: 'already-liked' };
+
+        const likeBtn = target.querySelector('[data-testid="like"]');
+        if (!likeBtn) return { ok: false, reason: 'like-button-missing' };
+
+        try {
+          likeBtn.click();
+        } catch {
+          try {
+            likeBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          } catch {
+            return { ok: false, reason: 'like-click-failed' };
+          }
+        }
+        return { ok: true, state: 'liked' };
+      }
+      """,
+      target_status_id,
+    )
+    if not isinstance(result, dict):
+      self._log("Accion Like: respuesta inesperada")
+      return
+    if bool(result.get("ok", False)):
+      state = str(result.get("state") or "ok")
+      if state == "already-liked":
+        self._log("Accion Like: ya tenia like")
+      else:
+        self._log("Accion Like: aplicada")
+      return
+    self._log(f"Accion Like: no se pudo ({result.get('reason') or 'sin-detalle'})")
+
+  def _retweet_current_twitter_post(self, page) -> None:
+    target_status_id = self._resolve_action_target_status_id(page)
+    if not target_status_id:
+      self._log("Accion Retweet: no se pudo resolver tweet objetivo")
+      return
+
+    first = page.evaluate(
+      """
+      (targetStatusId) => {
+        const vh = window.innerHeight || document.documentElement.clientHeight;
+        const normalizedTarget = String(targetStatusId || '').trim();
+        if (!normalizedTarget) return { ok: false, reason: 'no-target-status-id' };
+
+        const statusIdFrom = (href) => {
+          const m = String(href || '').match(/\/status\/(\d+)/i);
+          return m ? String(m[1]) : '';
+        };
+
+        const articles = Array.from(document.querySelectorAll('article'));
+        let target = null;
+        let best = Number.POSITIVE_INFINITY;
+
+        for (const article of articles) {
+          const links = Array.from(article.querySelectorAll('a[href*="/status/"]'));
+          if (!links.length) continue;
+          const matchesTarget = links.some((a) => statusIdFrom(a.href || a.getAttribute('href') || '') === normalizedTarget);
+          if (!matchesTarget) continue;
+
+          const hasActionBar = Boolean(
+            article.querySelector('[data-testid="retweet"], [data-testid="unretweet"]')
+          );
+          if (!hasActionBar) continue;
+
+          const rect = article.getBoundingClientRect();
+          if (rect.bottom <= 0 || rect.top >= vh) continue;
+          const centerDelta = Math.abs((rect.top + rect.height / 2) - (vh / 2));
+          if (centerDelta < best) {
+            best = centerDelta;
+            target = article;
+          }
+        }
+
+        if (!target) return { ok: false, reason: 'no-target' };
+
+        const alreadyRetweeted = target.querySelector('[data-testid="unretweet"]');
+        if (alreadyRetweeted) return { ok: true, state: 'already-retweeted' };
+
+        const rtBtn = target.querySelector('[data-testid="retweet"]');
+        if (!rtBtn) return { ok: false, reason: 'retweet-button-missing' };
+
+        try {
+          rtBtn.click();
+        } catch {
+          try {
+            rtBtn.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+          } catch {
+            return { ok: false, reason: 'retweet-click-failed' };
+          }
+        }
+
+        return { ok: true, state: 'menu-opened' };
+      }
+      """,
+      target_status_id,
+    )
+
+    if not isinstance(first, dict):
+      self._log("Accion Retweet: respuesta inesperada")
+      return
+    if not bool(first.get("ok", False)):
+      self._log(f"Accion Retweet: no se pudo ({first.get('reason') or 'sin-detalle'})")
+      return
+    if str(first.get("state") or "") == "already-retweeted":
+      self._log("Accion Retweet: ya estaba retweeteado")
+      return
+
+    confirmed = False
+    for _ in range(12):
+      try:
+        confirmed = bool(
+          page.evaluate(
+            """
+            () => {
+              const retweetOnly = document.querySelector('[data-testid="retweetConfirm"]');
+              if (!retweetOnly) return false;
+              try {
+                retweetOnly.click();
+                return true;
+              } catch {
+                try {
+                  retweetOnly.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                  return true;
+                } catch {
+                  return false;
+                }
+              }
+            }
+            """
+          )
+        )
+      except Exception:
+        confirmed = False
+      if confirmed:
+        break
+      time.sleep(0.08)
+
+    if confirmed:
+      self._log("Accion Retweet: aplicada (retweet normal)")
+      return
+    self._log("Accion Retweet: no aparecio opcion de retweet")
 
   def _platform_url(self, platform: Platform) -> str:
     match platform:
@@ -591,6 +843,7 @@ class FeedScraper:
 
     while not self._stop_event.is_set():
       self._ensure_twitter_home(page)
+      self._drain_pending_user_actions(page)
       if self._wait_if_paused(page):
         return
       current = self._twitter_top_visible_media_item(page, min_abs_top=last_processed_abs_top)
@@ -610,6 +863,8 @@ class FeedScraper:
         if wait_result == "stop":
           return
         continue
+
+      self._twitter_focus_status_id = current_url
 
       current_payload = {
         "url": current_url,
