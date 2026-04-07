@@ -1,0 +1,10 @@
+{
+  "x_user": "your_x_user",
+  "output_dir": "./output",
+  "cookies_dir": "./cookies",
+  "show_browser": true,
+  "auto_save": true,
+  "per_post_folder": true,
+  "download_delay": "0",
+  "cookie_rotation_interval": "120"
+}

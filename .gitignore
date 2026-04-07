@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Caches / test artifacts
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs / temp
+*.log
+*.tmp
+*.temp
+activity.log
+
+# Local secrets / env
+.env
+.env.*
+*.key
+*.pem
+
+# Runtime browser profiles
+browser_profile/
+browser_profiles/
+
+# Test / debug probe files
+*_probe.txt
+with_replies_probe.txt
+
+# Cookies and private session artifacts
+cookies/
+cookies/*.txt
+cookies/*.json
+
+# Runtime state/cache
+feed_metadata/
+downloader_settings.json
+
+# Optional local outputs inside downloader
+images/
+videos/
+output/
