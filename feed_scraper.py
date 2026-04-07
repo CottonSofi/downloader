@@ -2,6 +2,7 @@ import os
 import threading
 import time
 import json
+import re
 from enum import Enum
 from typing import Callable
 
@@ -37,6 +38,9 @@ class FeedScraper:
     only_visible: bool = True,
     start_maximized: bool = True,
     tiktok_likes_only: bool = False,
+    monitor_bounds: dict | None = None,
+    instance_name: str = "",
+    cookie_candidates: list[str] | None = None,
   ):
     self.on_url_detected = on_url_detected
     self.poll_seconds = max(0.2, float(poll_seconds or 1.5))
@@ -49,19 +53,111 @@ class FeedScraper:
     self.only_visible = bool(only_visible)
     self.start_maximized = bool(start_maximized)
     self.tiktok_likes_only = bool(tiktok_likes_only)
+    self.monitor_bounds = monitor_bounds if isinstance(monitor_bounds, dict) else None
+    self.instance_name = (instance_name or "").strip()
+    self.cookie_candidates = [str(item).strip() for item in (cookie_candidates or []) if str(item).strip()]
 
     self._log_callback: Callable[[str], None] | None = None
     self._stop_event = threading.Event()
     self._thread: threading.Thread | None = None
     self._seen_urls: set[str] = set()
     self._deps_verified = False
+    self._pause_event = threading.Event()
+    self._skip_event = threading.Event()
+    self._kill_event = threading.Event()
+    self._state_lock = threading.Lock()
+    self._muted = False
+    self._window_fullscreen = False
+    self._pending_window_state: bool | None = None
+    self._last_home_guard_log_ts = 0.0
+    self._runtime_context = None
+    self._runtime_page = None
+    self._last_error_summary = ""
+    self._last_error_log_ts = 0.0
 
   def set_log_callback(self, callback: Callable[[str], None]) -> None:
     self._log_callback = callback
 
   def _log(self, message: str) -> None:
     if self._log_callback:
-      self._log_callback(message)
+      prefix = f"[{self.instance_name}] " if self.instance_name else ""
+      self._log_callback(prefix + message)
+
+  def is_running(self) -> bool:
+    return bool(self._thread and self._thread.is_alive())
+
+  def is_paused(self) -> bool:
+    return self._pause_event.is_set()
+
+  def pause(self) -> None:
+    self._pause_event.set()
+    self._log("Scraper en pausa")
+
+  def resume(self) -> None:
+    self._pause_event.clear()
+    self._log("Scraper reanudado")
+
+  def toggle_pause(self) -> bool:
+    if self.is_paused():
+      self.resume()
+    else:
+      self.pause()
+    return self.is_paused()
+
+  def set_muted(self, muted: bool) -> None:
+    with self._state_lock:
+      self._muted = bool(muted)
+    self._log("Audio: mute" if muted else "Audio: unmute")
+
+  def is_muted(self) -> bool:
+    with self._state_lock:
+      return bool(self._muted)
+
+  def is_window_fullscreen(self) -> bool:
+    with self._state_lock:
+      return bool(self._window_fullscreen)
+
+  def set_window_fullscreen(self, enabled: bool) -> None:
+    target = bool(enabled)
+    with self._state_lock:
+      if self._window_fullscreen == target and self._pending_window_state == target:
+        return
+      self._window_fullscreen = target
+      self._pending_window_state = target
+
+    state = "fullscreen" if target else "maximizada"
+    self._log(f"Ventana: {state}")
+
+  def toggle_window_fullscreen(self) -> bool:
+    with self._state_lock:
+      self._window_fullscreen = not self._window_fullscreen
+      target = self._window_fullscreen
+      self._pending_window_state = target
+
+    state = "fullscreen" if target else "maximizada"
+    self._log(f"Ventana: {state}")
+    return target
+
+  def toggle_muted(self) -> bool:
+    with self._state_lock:
+      self._muted = not self._muted
+      muted = self._muted
+    self._log("Audio: mute" if muted else "Audio: unmute")
+    return muted
+
+  def request_skip(self) -> None:
+    self._skip_event.set()
+
+  def kill(self) -> None:
+    self._kill_event.set()
+    self._stop_event.set()
+    try:
+      if self._runtime_context is not None:
+        self._runtime_context.close()
+    except Exception:
+      pass
+    if self._thread and self._thread.is_alive():
+      self._thread.join(timeout=2)
 
   def _is_module_available(self, import_name: str) -> bool:
     try:
@@ -92,14 +188,54 @@ class FeedScraper:
       return
 
     self._stop_event.clear()
+    self._kill_event.clear()
+    self._skip_event.clear()
+    self._pause_event.clear()
     selected = Platform.parse(platform)
     self._thread = threading.Thread(target=self._run, args=(selected,), daemon=True)
     self._thread.start()
 
   def stop(self) -> None:
     self._stop_event.set()
+    self._skip_event.set()
     if self._thread and self._thread.is_alive():
       self._thread.join(timeout=5)
+
+  def _wait_if_paused(self, page=None) -> bool:
+    while self._pause_event.is_set() and not self._stop_event.is_set() and not self._kill_event.is_set():
+      if page is not None:
+        try:
+          self._apply_pending_window_state(page)
+        except Exception:
+          pass
+        try:
+          self._sync_page_mute_state(page)
+        except Exception:
+          pass
+      time.sleep(0.15)
+    return bool(self._stop_event.is_set() or self._kill_event.is_set())
+
+  def _wait_with_interrupt(self, seconds: float, page=None) -> str:
+    end_at = time.time() + max(0.0, float(seconds or 0.0))
+    while time.time() < end_at:
+      if self._stop_event.is_set() or self._kill_event.is_set():
+        return "stop"
+      if self._wait_if_paused(page):
+        return "stop"
+      if self._skip_event.is_set():
+        self._skip_event.clear()
+        return "skip"
+      if page is not None:
+        try:
+          self._apply_pending_window_state(page)
+        except Exception:
+          pass
+        try:
+          self._sync_page_mute_state(page)
+        except Exception:
+          pass
+      time.sleep(0.12)
+    return "done"
 
   def _platform_url(self, platform: Platform) -> str:
     match platform:
@@ -114,13 +250,62 @@ class FeedScraper:
 
   def _profile_dir(self) -> str:
     root_dir = os.path.dirname(os.path.dirname(__file__))
+    if self.instance_name:
+      safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.instance_name).strip("_") or "instance"
+      profiles_root = os.path.join(root_dir, "downloader", "browser_profiles")
+      os.makedirs(profiles_root, exist_ok=True)
+      profile = os.path.join(profiles_root, safe_name)
+      os.makedirs(profile, exist_ok=True)
+      return profile
+
     preferred = os.path.join(root_dir, "browser_profile")
     if os.path.isdir(preferred):
       return preferred
-    return os.path.join(root_dir, "downloader", "browser_profile")
+    fallback = os.path.join(root_dir, "downloader", "browser_profile")
+    os.makedirs(fallback, exist_ok=True)
+    return fallback
+
+  def _error_summary(self, exc: Exception) -> str:
+    raw = str(exc or "").strip()
+    if not raw:
+      return "error desconocido"
+
+    if "Browser logs:" in raw:
+      raw = raw.split("Browser logs:", 1)[0].strip()
+    if "Call log:" in raw:
+      raw = raw.split("Call log:", 1)[0].strip()
+
+    first = raw.splitlines()[0].strip() if raw.splitlines() else raw
+    if "launch_persistent_context" in first and "Target page, context or browser has been closed" in first:
+      return "No se pudo abrir Chromium para esta instancia (perfil en uso o cerrado por conflicto)."
+
+    return first[:260]
+
+  def _log_scraper_error(self, exc: Exception) -> None:
+    summary = self._error_summary(exc)
+    now = time.time()
+    if summary == self._last_error_summary and (now - self._last_error_log_ts) < 12.0:
+      return
+    self._last_error_summary = summary
+    self._last_error_log_ts = now
+    self._log(f"Aviso scraper: {summary}")
 
   def _existing_cookie_files(self) -> list[str]:
     import random
+    if self.cookie_candidates:
+      unique_selected: list[str] = []
+      seen_selected: set[str] = set()
+      for item in self.cookie_candidates:
+        clean = (item or "").strip()
+        if not clean or not os.path.isfile(clean):
+          continue
+        key = os.path.normcase(os.path.abspath(clean))
+        if key in seen_selected:
+          continue
+        seen_selected.add(key)
+        unique_selected.append(clean)
+      return unique_selected
+
     root_dir = os.path.dirname(os.path.dirname(__file__))
     manual = (self.cookies_file or "").strip()
     
@@ -321,13 +506,19 @@ class FeedScraper:
     profile_dir = self._profile_dir()
 
     with sync_playwright() as p:
-      while not self._stop_event.is_set():
+      while not self._stop_event.is_set() and not self._kill_event.is_set():
         context = None
         page = None
         try:
           self._log(f"Abriendo feed {platform.value}: {start_url}")
           browser_args = ["--disable-infobars"]
-          if self.start_maximized:
+          bounds = self._normalized_monitor_bounds()
+          if bounds:
+            browser_args += [
+              f"--window-position={bounds['left']},{bounds['top']}",
+              f"--window-size={bounds['width']},{bounds['height']}",
+            ]
+          elif self.start_maximized:
             browser_args.append("--start-maximized")
 
           context = p.chromium.launch_persistent_context(
@@ -338,18 +529,23 @@ class FeedScraper:
           )
           self._apply_context_cookies(context)
           page = self._prepare_page(context)
+          self._runtime_context = context
+          self._runtime_page = page
           page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
-          self._maximize_window(page)
+          self._apply_window_placement(page)
+          self._apply_pending_window_state(page, force=True)
           self._log("Navegador listo. Desplazando y detectando URL visible...")
 
           self._scrape_loop(page, platform)
         except Exception as exc:
-          if self._stop_event.is_set():
+          if self._stop_event.is_set() or self._kill_event.is_set():
             break
-          self._log(f"Aviso scraper: {exc}")
+          self._log_scraper_error(exc)
           self._log("Reintentando inicializar navegador del feed en 3 segundos...")
           time.sleep(3)
         finally:
+          self._runtime_page = None
+          self._runtime_context = None
           if context is not None:
             try:
               context.close()
@@ -394,17 +590,34 @@ class FeedScraper:
     last_processed_abs_top = -1.0
 
     while not self._stop_event.is_set():
+      self._ensure_twitter_home(page)
+      if self._wait_if_paused(page):
+        return
       current = self._twitter_top_visible_media_item(page, min_abs_top=last_processed_abs_top)
       if not current:
+        if self._skip_event.is_set():
+          self._skip_event.clear()
         self._safe_scroll_down(page, min(320, max(140, int(self.scroll_px * 0.35))))
-        time.sleep(self.scroll_pause_seconds)
+        wait_result = self._wait_with_interrupt(self.scroll_pause_seconds, page)
+        if wait_result == "stop":
+          return
         continue
 
       current_url = str(current.get("url") or "").strip()
       if not current_url:
         self._scroll_by(page, min(260, max(120, int(self.scroll_px * 0.25))))
-        time.sleep(self.scroll_pause_seconds)
+        wait_result = self._wait_with_interrupt(self.scroll_pause_seconds, page)
+        if wait_result == "stop":
+          return
         continue
+
+      current_payload = {
+        "url": current_url,
+        "creator_hint": current.get("creator_hint"),
+        "prefer_image_output": bool(current.get("prefer_image_output", False)),
+        "media_kind": current.get("media_kind"),
+        "media_urls": list(current.get("media_urls") or []),
+      }
 
       self._center_twitter_item(page, current_url)
 
@@ -412,12 +625,37 @@ class FeedScraper:
         self._seen_urls.add(current_url)
         self._log(f"Detectado: {current_url}")
         try:
-          self.on_url_detected(current_url)
+          self.on_url_detected(current_payload)
         except Exception as callback_exc:
           self._log(f"Aviso callback descarga: {callback_exc}")
 
+      related_items = list(current.get("related_items") or [])
+      if not related_items:
+        related_items = [{"url": item} for item in list(current.get("related_urls") or [])]
+
+      for related in related_items:
+        related_clean = str((related or {}).get("url") or "").strip()
+        if not related_clean or related_clean == current_url or related_clean in self._seen_urls:
+          continue
+        self._seen_urls.add(related_clean)
+        self._log(f"Detectado relacionado: {related_clean}")
+        try:
+          rel_has_photo = bool((related or {}).get("has_photo", False))
+          self.on_url_detected(
+            {
+              "url": related_clean,
+              "creator_hint": current.get("creator_hint"),
+              "prefer_image_output": rel_has_photo,
+              "media_kind": "image" if rel_has_photo else "",
+            }
+          )
+        except Exception as callback_exc:
+          self._log(f"Aviso callback descarga relacionada: {callback_exc}")
+
       media_count = int(current.get("media_count") or 1)
+      carousel_count = int(current.get("carousel_count") or media_count or 1)
       is_video = bool(current.get("has_video", False))
+      is_carousel = bool(current.get("is_carousel", False)) or carousel_count > 1
       current_abs_top = float(current.get("abs_top") or 0.0)
 
       if current_abs_top > last_processed_abs_top:
@@ -429,12 +667,50 @@ class FeedScraper:
         self._wait_video_or_timeout(page, current_url)
         self._try_fullscreen_current_video(page, current_url, enter=False)
       else:
-        self._process_twitter_carousel(page, current_url, media_count)
+        self._process_twitter_image_item(page, current_url, carousel_count if is_carousel else media_count)
 
       moved = self._move_to_next_twitter_item(page, current_url, last_processed_abs_top)
       if not moved:
         self._safe_scroll_down(page, min(320, max(140, int(self.scroll_px * 0.35))))
-      time.sleep(self.scroll_pause_seconds)
+      wait_result = self._wait_with_interrupt(self.scroll_pause_seconds, page)
+      if wait_result == "stop":
+        return
+
+  def _ensure_twitter_home(self, page) -> None:
+    try:
+      state = page.evaluate(
+        """
+        () => {
+          const href = String(window.location.href || '');
+          const host = String(window.location.hostname || '').toLowerCase();
+          const path = String(window.location.pathname || '').toLowerCase();
+          const isXHost = host === 'x.com' || host === 'www.x.com' || host === 'twitter.com' || host === 'www.twitter.com';
+          const isHome = path === '/home' || path === '/home/' || path.startsWith('/home?');
+          return { href, isXHost, isHome };
+        }
+        """
+      )
+    except Exception:
+      return
+
+    if not isinstance(state, dict):
+      return
+    if not bool(state.get("isXHost", False)):
+      return
+    if bool(state.get("isHome", False)):
+      return
+
+    now = time.time()
+    if (now - self._last_home_guard_log_ts) >= 8.0:
+      current = str(state.get("href") or "").strip() or "(desconocido)"
+      self._log(f"Home guard: fuera de Home ({current}), regresando a /home")
+      self._last_home_guard_log_ts = now
+
+    try:
+      page.goto("https://x.com/home", wait_until="domcontentloaded", timeout=45000)
+      self._apply_window_placement(page)
+    except Exception:
+      return
 
   def _twitter_top_visible_media_item(self, page, min_abs_top: float = -1.0) -> dict | None:
     return page.evaluate(
@@ -465,30 +741,103 @@ class FeedScraper:
           return count;
         };
 
+        const normalizeImageUrl = (value) => {
+          if (!value) return null;
+          try {
+            const parsed = new URL(String(value), window.location.href);
+            const host = parsed.hostname.toLowerCase();
+            if (!host.includes('twimg.com')) return null;
+            if (!/\/media\//i.test(parsed.pathname)) return null;
+            parsed.searchParams.set('name', 'orig');
+            return parsed.toString();
+          } catch {
+            return null;
+          }
+        };
+
         const out = [];
         for (const article of articles) {
           const rect = article.getBoundingClientRect();
           const visible = rect.bottom > 0 && rect.top < vh;
           if (!visible) continue;
 
-          const link = article.querySelector('a[href*="/status/"]');
-          if (!link) continue;
+          const statusLinks = Array.from(article.querySelectorAll('a[href*="/status/"]'))
+            .map((anchor, index) => {
+              const rawHref = anchor.href || anchor.getAttribute('href') || '';
+              const canonicalHref = canonical(rawHref);
+              return {
+                url: canonicalHref,
+                raw_url: rawHref,
+                has_photo: /\/photo\//i.test(rawHref),
+                has_video_link: /\/video\//i.test(rawHref),
+                has_time: !!anchor.querySelector('time'),
+                index,
+              };
+            })
+            .filter((item) => !!item.url);
+
+          if (!statusLinks.length) continue;
 
           const mediaCount = visibleMediaCount(article);
+          const imageUrls = Array.from(article.querySelectorAll('img'))
+            .map((img) => normalizeImageUrl(img.currentSrc || img.src || img.getAttribute('src') || ''))
+            .filter((value, index, array) => !!value && array.indexOf(value) === index);
+          const imageCount = imageUrls.length;
+          const hasPhotoLinks = statusLinks.some((item) => item.has_photo);
+          const photoLinkCount = statusLinks.filter((item) => item.has_photo).length;
           const hasVideo = Boolean(article.querySelector('video'));
-          if (mediaCount <= 0 && !hasVideo) continue;
+          const hasCarouselControls = Boolean(
+            article.querySelector('button[data-testid="carouselControl-right"], button[aria-label*="Next" i], div[role="button"][aria-label*="Next" i]')
+          );
+          const hasImage = imageCount > 0 || hasPhotoLinks;
+          if (mediaCount <= 0 && !hasVideo && !hasImage && !hasCarouselControls) continue;
 
           const absTop = (window.scrollY || window.pageYOffset || 0) + rect.top;
           if (absTop <= Number(minAbsTop || -1) + 40) continue;
 
+          let primary = statusLinks[0].url;
+          const preferredLink = statusLinks.find((item) => item.has_photo || item.has_video_link);
+          if (preferredLink) {
+            primary = preferredLink.url;
+          } else {
+            const timeLink = statusLinks.find((item) => item.has_time);
+            if (timeLink) {
+              primary = timeLink.url;
+            }
+          }
+
+          const relatedUrls = [];
+          const relatedItems = [];
+          const relatedSeen = new Set([primary]);
+          for (const link of statusLinks) {
+            if (relatedSeen.has(link.url)) continue;
+            relatedSeen.add(link.url);
+            relatedUrls.push(link.url);
+            relatedItems.push({
+              url: link.url,
+              has_photo: !!link.has_photo,
+              has_video_link: !!link.has_video_link,
+            });
+          }
+
           out.push({
-            url: canonical(link.href),
-            raw_url: link.href,
+            url: primary,
+            related_urls: relatedUrls.slice(0, 4),
+            related_items: relatedItems.slice(0, 4),
+            raw_urls: statusLinks.map((item) => item.raw_url),
+            creator_hint: null,
             top: rect.top,
             abs_top: absTop,
             center: rect.top + rect.height / 2,
             has_video: hasVideo,
-            media_count: Math.max(1, mediaCount),
+            has_image: hasImage,
+            media_count: Math.max(1, mediaCount, imageCount, photoLinkCount),
+            image_count: imageCount,
+            carousel_count: hasCarouselControls ? Math.max(2, photoLinkCount || imageCount || mediaCount || 2) : Math.max(1, photoLinkCount || imageCount || mediaCount),
+            is_carousel: (hasCarouselControls || imageCount > 1 || photoLinkCount > 1) && !hasVideo,
+            prefer_image_output: hasImage && !hasVideo,
+            media_kind: hasVideo ? 'video' : (imageCount > 1 || photoLinkCount > 1 || hasCarouselControls ? 'carousel' : (hasImage ? 'image' : 'unknown')),
+            media_urls: imageUrls.slice(0, 6),
           });
         }
 
@@ -514,7 +863,6 @@ class FeedScraper:
             if (!m) return href;
             return `https://x.com/${m[1]}/status/${m[2]}`;
           };
-
           for (const article of articles) {
             const link = article.querySelector('a[href*="/status/"]');
             if (!link) continue;
@@ -614,21 +962,84 @@ class FeedScraper:
 
           if (!best) return { has_video: false, ended: false, paused: true, current_time: 0, duration: 0 };
 
+          const trackerFor = (video) => {
+            if (video.__feedTracker) {
+              return video.__feedTracker;
+            }
+
+            const tracker = {
+              play_ms: 0,
+              started_at: null,
+              last_current_time: 0,
+              last_duration: 0,
+              loop_count: 0,
+            };
+
+            const accrue = () => {
+              if (tracker.started_at !== null) {
+                tracker.play_ms += performance.now() - tracker.started_at;
+                tracker.started_at = null;
+              }
+            };
+
+            const markPlaying = () => {
+              tracker.last_duration = Number(video.duration || 0) || tracker.last_duration || 0;
+              if (!video.paused && !video.ended && tracker.started_at === null) {
+                tracker.started_at = performance.now();
+              }
+            };
+
+            try {
+              video.addEventListener('play', markPlaying, true);
+              video.addEventListener('playing', markPlaying, true);
+              video.addEventListener('pause', accrue, true);
+              video.addEventListener('ended', accrue, true);
+              video.addEventListener('loadedmetadata', markPlaying, true);
+              video.addEventListener('timeupdate', () => {
+                const currentTime = Number(video.currentTime || 0);
+                if (tracker.started_at !== null && currentTime + 0.5 < tracker.last_current_time) {
+                  tracker.loop_count += 1;
+                }
+                tracker.last_current_time = currentTime;
+                tracker.last_duration = Number(video.duration || 0) || tracker.last_duration || 0;
+                if (!video.paused && !video.ended && tracker.started_at === null) {
+                  tracker.started_at = performance.now();
+                }
+              }, true);
+            } catch {}
+
+            video.__feedTracker = tracker;
+            return tracker;
+          };
+
+          const playedSecondsFor = (tracker) => {
+            if (!tracker) return 0;
+            if (tracker.started_at !== null) {
+              return (tracker.play_ms + (performance.now() - tracker.started_at)) / 1000;
+            }
+            return tracker.play_ms / 1000;
+          };
+
+          const record = trackerFor(best);
+
           try {
-            best.muted = false;
-            best.volume = 1.0;
             best.play();
           } catch {}
 
-          const duration = Number(best.duration || 0);
+          const duration = Number(best.duration || 0) || Number(record.last_duration || 0) || 0;
           const currentTime = Number(best.currentTime || 0);
-          const ended = Boolean(best.ended) || (duration > 0 && currentTime >= duration - 0.35);
+          const playedSeconds = playedSecondsFor(record);
+          const ended = Boolean(best.ended) || (duration > 0 && currentTime >= duration - 0.35) || (duration > 0 && playedSeconds >= duration - 0.35);
           return {
             has_video: true,
             ended,
             paused: Boolean(best.paused),
+            playing: !Boolean(best.paused) && !Boolean(best.ended),
             current_time: currentTime,
             duration,
+            play_time: playedSeconds,
+            loop_count: Number(record.loop_count || 0),
+            duration_known: duration > 0,
           };
         }
 
@@ -639,18 +1050,81 @@ class FeedScraper:
     )
 
   def _play_and_unmute_primary_video(self, page, target_url: str) -> None:
+    muted = self.is_muted()
+    page.evaluate(
+      """
+      ({ targetUrl, muted }) => {
+        const canonical = (href) => {
+          if (!href) return null;
+          const m = String(href).match(/https?:\/\/(?:www\.)?(?:x|twitter)\.com\/([^\/?#]+)\/status\/(\d+)/i);
+          if (!m) return href;
+          return `https://x.com/${m[1]}/status/${m[2]}`;
+        };
+        const articles = Array.from(document.querySelectorAll('article'));
+        for (const article of articles) {
+          const link = article.querySelector('a[href*="/status/"]');
+          if (!link || canonical(link.href) !== targetUrl) continue;
+          const v = article.querySelector('video');
+          if (!v) return;
+          try {
+            v.muted = Boolean(muted);
+            if (!Boolean(muted)) {
+              v.volume = 1.0;
+            }
+            v.play();
+          } catch {}
+          return;
+        }
+      }
+      """,
+      {"targetUrl": target_url, "muted": muted},
+    )
     _ = self._video_state_for_url(page, target_url)
+
+  def _sync_page_mute_state(self, page) -> None:
+    muted = self.is_muted()
+    page.evaluate(
+      """
+      (muted) => {
+        const videos = Array.from(document.querySelectorAll('video'));
+        for (const v of videos) {
+          try {
+            v.muted = Boolean(muted);
+            if (!Boolean(muted)) {
+              v.volume = 1.0;
+            }
+          } catch {}
+        }
+      }
+      """,
+      muted,
+    )
 
   def _wait_video_or_timeout(self, page, target_url: str) -> None:
     if not self.wait_video_end:
-      time.sleep(self.image_dwell_seconds)
+      wait_result = self._wait_with_interrupt(self.image_dwell_seconds, page)
+      if wait_result in {"skip", "stop"}:
+        return
       return
 
     start = time.time()
     while not self._stop_event.is_set():
+      if self._wait_if_paused(page):
+        return
+      if self._skip_event.is_set():
+        self._skip_event.clear()
+        return
       state = self._video_state_for_url(page, target_url)
       if not state.get("has_video", False):
-        time.sleep(self.image_dwell_seconds)
+        wait_result = self._wait_with_interrupt(self.image_dwell_seconds, page)
+        if wait_result in {"skip", "stop"}:
+          return
+        return
+
+      play_time = float(state.get("play_time") or 0.0)
+      duration = float(state.get("duration") or 0.0)
+
+      if duration > 0 and play_time >= max(0.0, duration - 0.35):
         return
 
       if bool(state.get("paused", False)):
@@ -666,7 +1140,9 @@ class FeedScraper:
         )
         return
 
-      time.sleep(max(0.2, self.poll_seconds))
+      wait_result = self._wait_with_interrupt(max(0.2, self.poll_seconds), page)
+      if wait_result in {"skip", "stop"}:
+        return
 
   def _try_fullscreen_current_video(self, page, target_url: str, enter: bool) -> None:
     page.evaluate(
@@ -705,29 +1181,125 @@ class FeedScraper:
       {"targetUrl": target_url, "enter": enter},
     )
 
-  def _process_twitter_carousel(self, page, target_url: str, media_count: int) -> None:
+  def _process_twitter_carousel(self, page, target_url: str, media_count: int, in_viewer: bool = False) -> None:
     # Si no hay carrusel, espera tiempo de imagen normal.
     if media_count <= 1:
-      time.sleep(self.image_dwell_seconds)
+      wait_result = self._wait_with_interrupt(self.image_dwell_seconds, page)
+      if wait_result in {"skip", "stop"}:
+        return
       return
 
-    slides = min(max(1, media_count), 8)
+    slides = min(max(1, media_count), 4)
     for idx in range(slides):
       if self._stop_event.is_set():
         return
-      time.sleep(self.image_dwell_seconds)
+      wait_result = self._wait_with_interrupt(self.image_dwell_seconds, page)
+      if wait_result in {"skip", "stop"}:
+        return
       if idx >= slides - 1:
         break
-      moved = self._twitter_click_next_media(page, target_url)
+      moved = self._twitter_click_next_media(page, target_url, in_viewer=in_viewer)
       if not moved:
         break
-      time.sleep(max(0.15, self.poll_seconds * 0.5))
+      wait_result = self._wait_with_interrupt(max(0.15, self.poll_seconds * 0.5), page)
+      if wait_result in {"skip", "stop"}:
+        return
 
-  def _twitter_click_next_media(self, page, target_url: str) -> bool:
+  def _process_twitter_image_item(self, page, target_url: str, media_count: int) -> None:
+    opened = self._open_twitter_image_viewer(page, target_url)
+    if not opened:
+      self._process_twitter_carousel(page, target_url, media_count)
+      return
+
+    try:
+      self._process_twitter_carousel(page, target_url, media_count, in_viewer=True)
+    finally:
+      self._close_twitter_image_viewer(page)
+
+  def _open_twitter_image_viewer(self, page, target_url: str) -> bool:
     return bool(
       page.evaluate(
         """
         (targetUrl) => {
+          const canonical = (href) => {
+            if (!href) return null;
+            const m = String(href).match(/https?:\/\/(?:www\.)?(?:x|twitter)\.com\/([^\/?#]+)\/status\/(\d+)/i);
+            if (!m) return href;
+            return `https://x.com/${m[1]}/status/${m[2]}`;
+          };
+
+          const articles = Array.from(document.querySelectorAll('article'));
+          for (const article of articles) {
+            const statusAnchor = article.querySelector('a[href*="/status/"]');
+            if (!statusAnchor || canonical(statusAnchor.href) !== targetUrl) continue;
+
+            const preferred = article.querySelector('a[href*="/status/"][href*="/photo/"] img')
+              || article.querySelector('img[src*="twimg.com/media"], img[src*="pbs.twimg.com/media"], img');
+            if (!preferred) return false;
+
+            const clickable = preferred.closest('a, div[role="button"], button') || preferred;
+            try {
+              clickable.scrollIntoView({ behavior: 'instant', block: 'center' });
+            } catch {}
+            try {
+              clickable.click();
+              return true;
+            } catch {
+              try {
+                preferred.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                return true;
+              } catch {
+                return false;
+              }
+            }
+          }
+          return false;
+        }
+        """,
+        target_url,
+      )
+    )
+
+  def _close_twitter_image_viewer(self, page) -> None:
+    _ = page.evaluate(
+      """
+      () => {
+        const closeBtn = document.querySelector('button[aria-label*="Close" i], div[role="button"][aria-label*="Close" i]');
+        if (closeBtn) {
+          try {
+            closeBtn.click();
+            return true;
+          } catch {}
+        }
+
+        try {
+          document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+          return true;
+        } catch {}
+        return false;
+      }
+      """
+    )
+    wait_result = self._wait_with_interrupt(max(0.15, self.poll_seconds * 0.4), page)
+    if wait_result in {"skip", "stop"}:
+      return
+
+  def _twitter_click_next_media(self, page, target_url: str, in_viewer: bool = False) -> bool:
+    return bool(
+      page.evaluate(
+        """
+        ({ targetUrl, inViewer }) => {
+          if (inViewer) {
+            const nextViewer = document.querySelector('button[aria-label*="Next" i], div[role="button"][aria-label*="Next" i], button[data-testid="carouselControl-right"]');
+            if (!nextViewer) return false;
+            try {
+              nextViewer.click();
+              return true;
+            } catch {
+              return false;
+            }
+          }
+
           const articles = Array.from(document.querySelectorAll('article'));
           const canonical = (href) => {
             if (!href) return null;
@@ -748,7 +1320,7 @@ class FeedScraper:
           return false;
         }
         """,
-        target_url,
+        {"targetUrl": target_url, "inViewer": bool(in_viewer)},
       )
     )
 
@@ -844,18 +1416,123 @@ class FeedScraper:
     state = self._primary_visible_video_state(page)
     return bool(state.get("has_video", False))
 
-  def _maximize_window(self, page) -> None:
-    if not self.start_maximized:
-      return
+  def _apply_window_placement(self, page) -> None:
     try:
       cdp = page.context.new_cdp_session(page)
       info = cdp.send("Browser.getWindowForTarget")
-      cdp.send("Browser.setWindowBounds", {
-        "windowId": info["windowId"],
-        "bounds": {"windowState": "maximized"},
-      })
+      window_id = info["windowId"]
+      bounds = self._normalized_monitor_bounds()
+      if bounds:
+        # First move/resize the native window to the selected monitor.
+        cdp.send(
+          "Browser.setWindowBounds",
+          {
+            "windowId": window_id,
+            "bounds": {
+              "windowState": "normal",
+              "left": bounds["left"],
+              "top": bounds["top"],
+              "width": bounds["width"],
+              "height": bounds["height"],
+            },
+          },
+        )
+
+        # Then maximize while it is already located on the target monitor.
+        if self.start_maximized:
+          cdp.send(
+            "Browser.setWindowBounds",
+            {
+              "windowId": window_id,
+              "bounds": {"windowState": "maximized"},
+            },
+          )
+      elif self.start_maximized:
+        cdp.send("Browser.setWindowBounds", {
+          "windowId": window_id,
+          "bounds": {"windowState": "maximized"},
+        })
     except Exception:
       pass
+
+  def _apply_pending_window_state(self, page, force: bool = False) -> None:
+    pending: bool | None = None
+    with self._state_lock:
+      pending = self._pending_window_state
+      if force and pending is None:
+        pending = self._window_fullscreen
+      self._pending_window_state = None
+
+    if pending is None:
+      return
+
+    self._apply_window_state(page, bool(pending))
+
+  def _apply_window_state(self, page, fullscreen: bool) -> None:
+    try:
+      cdp = page.context.new_cdp_session(page)
+      info = cdp.send("Browser.getWindowForTarget")
+      window_id = info["windowId"]
+      if fullscreen:
+        try:
+          cdp.send(
+            "Browser.setWindowBounds",
+            {
+              "windowId": window_id,
+              "bounds": {"windowState": "fullscreen"},
+            },
+          )
+        except Exception:
+          cdp.send(
+            "Browser.setWindowBounds",
+            {
+              "windowId": window_id,
+              "bounds": {"windowState": "maximized"},
+            },
+          )
+      else:
+        bounds = self._normalized_monitor_bounds()
+        if bounds:
+          cdp.send(
+            "Browser.setWindowBounds",
+            {
+              "windowId": window_id,
+              "bounds": {
+                "windowState": "normal",
+                "left": bounds["left"],
+                "top": bounds["top"],
+                "width": bounds["width"],
+                "height": bounds["height"],
+              },
+            },
+          )
+        cdp.send(
+          "Browser.setWindowBounds",
+          {
+            "windowId": window_id,
+            "bounds": {"windowState": "maximized"},
+          },
+        )
+    except Exception:
+      pass
+
+  def _normalized_monitor_bounds(self) -> dict | None:
+    raw = self.monitor_bounds
+    if not isinstance(raw, dict):
+      return None
+    try:
+      left = int(raw.get("left", 0))
+      top = int(raw.get("top", 0))
+      width = max(640, int(raw.get("width", 0)))
+      height = max(480, int(raw.get("height", 0)))
+      return {
+        "left": left,
+        "top": top,
+        "width": width,
+        "height": height,
+      }
+    except Exception:
+      return None
 
   def _advance(self, page) -> None:
     page.evaluate(

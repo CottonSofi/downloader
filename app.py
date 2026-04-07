@@ -8,8 +8,9 @@ import sys
 import threading
 import time
 import tkinter as tk
+import ctypes
 from datetime import datetime
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 from urllib.parse import urlsplit, urlunsplit
 from tkinter import filedialog, messagebox, ttk
 
@@ -138,8 +139,8 @@ class DownloaderApp:
   def __init__(self, root: tk.Tk):
     self.root = root
     self.root.title(APP_TITLE)
-    self.root.geometry("900x680")
-    self.root.minsize(840, 620)
+    self.root.geometry("1120x760")
+    self.root.minsize(980, 680)
 
     self.log_queue: queue.Queue[str] = queue.Queue()
     self.video_info = None
@@ -186,6 +187,7 @@ class DownloaderApp:
     self.use_cookies_var = tk.BooleanVar(value=False)
     self.cookies_browser_var = tk.StringVar(value="chrome")
     self.cookies_file_var = tk.StringVar(value="")
+    self.cookies_folder_var = tk.StringVar(value="")
     self.start_with_windows_var = tk.BooleanVar(value=False)
     self.feed_image_seconds_var = tk.StringVar(value="10")
     self.feed_scroll_pause_var = tk.StringVar(value="1.5")
@@ -217,8 +219,19 @@ class DownloaderApp:
     self.clipboard_poll_ms = 1200
     self.clipboard_seen_urls: set[str] = set()
     self.clipboard_pending_url: str | None = None
+    self.monitors: list[dict] = self._detect_monitors()
+    self.twitter_instances: dict[int, dict] = {}
+    self.twitter_instance_seq = 1
+    self.twitter_instances_lock = threading.Lock()
+    self.twitter_monitor_cookie_choice: dict[int, str] = {}
+    self.x_instances_panel: ttk.LabelFrame | None = None
+    self.x_instances_table: ttk.Frame | None = None
+    self.x_instances_hint_var = tk.StringVar(value="")
+    self.log_frame_widget: ttk.LabelFrame | None = None
+    self.x_instances_signature: tuple | None = None
 
     self._load_start_with_windows_state()
+    self._configure_ui_theme()
     self._build_ui()
     self._prepare_log_file()
     self._auto_load_default_cookies_file()
@@ -227,6 +240,7 @@ class DownloaderApp:
 
     self.root.after(150, self._drain_log_queue)
     self._check_dependencies()
+    self.root.after(1500, self._refresh_x_instances_ui_tick)
     self.root.after(self.clipboard_poll_ms, self._poll_clipboard)
 
   def _is_module_available(self, import_name: str) -> bool:
@@ -239,6 +253,600 @@ class DownloaderApp:
   def _tr(self, key: str, default: str) -> str:
     lang = (self.ui_language_var.get() or "es").strip().lower()
     return UI_TEXTS.get(lang, UI_TEXTS["es"]).get(key, default)
+
+  def _configure_ui_theme(self) -> None:
+    self.root.configure(bg="#eef2f7")
+    style = ttk.Style(self.root)
+    try:
+      style.theme_use("clam")
+    except Exception:
+      pass
+
+    base_font = ("Segoe UI", 10)
+    heading_font = ("Segoe UI Semibold", 10)
+
+    style.configure(".", font=base_font, background="#eef2f7", foreground="#1f2937")
+    style.configure("TFrame", background="#eef2f7")
+    style.configure("Card.TLabelframe", background="#f8fafc", borderwidth=1, relief="solid")
+    style.configure("Card.TLabelframe.Label", background="#eef2f7", foreground="#0f172a", font=heading_font)
+    style.configure("TLabel", background="#eef2f7", foreground="#1f2937")
+    style.configure("TCheckbutton", background="#eef2f7", foreground="#1f2937")
+    style.configure("TEntry", fieldbackground="#ffffff", foreground="#111827", padding=5)
+    style.configure("TCombobox", fieldbackground="#ffffff", foreground="#111827", padding=4)
+    style.configure("TButton", padding=(10, 6), font=("Segoe UI Semibold", 9))
+
+    style.configure("Accent.TButton", background="#2563eb", foreground="#ffffff", bordercolor="#1d4ed8")
+    style.map(
+      "Accent.TButton",
+      background=[("pressed", "#1e3a8a"), ("active", "#1d4ed8")],
+      foreground=[("disabled", "#cbd5e1"), ("!disabled", "#ffffff")],
+    )
+
+    style.configure("Danger.TButton", background="#ef4444", foreground="#ffffff", bordercolor="#dc2626")
+    style.map(
+      "Danger.TButton",
+      background=[("pressed", "#b91c1c"), ("active", "#dc2626")],
+      foreground=[("disabled", "#cbd5e1"), ("!disabled", "#ffffff")],
+    )
+
+    style.configure("Subtle.TButton", background="#e2e8f0", foreground="#0f172a")
+    style.map("Subtle.TButton", background=[("active", "#cbd5e1")])
+
+  def _detect_monitors(self) -> list[dict]:
+    monitors: list[dict] = []
+
+    if sys.platform == "win32":
+      try:
+        from ctypes import wintypes
+
+        class RECT(ctypes.Structure):
+          _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+          ]
+
+        class MONITORINFOEXW(ctypes.Structure):
+          _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", RECT),
+            ("rcWork", RECT),
+            ("dwFlags", wintypes.DWORD),
+            ("szDevice", ctypes.c_wchar * 32),
+          ]
+
+        monitor_enum_proc = ctypes.WINFUNCTYPE(
+          ctypes.c_int,
+          wintypes.HMONITOR,
+          wintypes.HDC,
+          ctypes.POINTER(RECT),
+          wintypes.LPARAM,
+        )
+
+        user32 = ctypes.windll.user32
+
+        def _callback(hmonitor, _hdc, _rect, _lparam):
+          info = MONITORINFOEXW()
+          info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+          if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+            left = int(info.rcMonitor.left)
+            top = int(info.rcMonitor.top)
+            right = int(info.rcMonitor.right)
+            bottom = int(info.rcMonitor.bottom)
+            width = max(1, right - left)
+            height = max(1, bottom - top)
+            monitors.append(
+              {
+                "left": left,
+                "top": top,
+                "width": width,
+                "height": height,
+                "primary": bool(int(info.dwFlags) & 1),
+                "device": str(info.szDevice or ""),
+              }
+            )
+          return 1
+
+        user32.EnumDisplayMonitors(0, 0, monitor_enum_proc(_callback), 0)
+      except Exception:
+        monitors = []
+
+    if not monitors:
+      monitors = [
+        {
+          "left": 0,
+          "top": 0,
+          "width": int(self.root.winfo_screenwidth()),
+          "height": int(self.root.winfo_screenheight()),
+          "primary": True,
+          "device": "DISPLAY1",
+        }
+      ]
+
+    monitors.sort(key=lambda item: (not bool(item.get("primary", False)), int(item.get("left", 0)), int(item.get("top", 0))))
+    for idx, item in enumerate(monitors, start=1):
+      item["id"] = idx
+      item["label"] = (
+        f"Monitor {idx}"
+        f" ({int(item.get('width', 0))}x{int(item.get('height', 0))}"
+        f" @ {int(item.get('left', 0))},{int(item.get('top', 0))})"
+      )
+    return monitors
+
+  def _has_active_twitter_instances(self) -> bool:
+    with self.twitter_instances_lock:
+      for item in self.twitter_instances.values():
+        scraper = item.get("scraper")
+        if scraper and scraper.is_running():
+          return True
+    return False
+
+  def _update_scraping_state(self) -> None:
+    has_single = bool(self.scraper and self.scraper.is_running())
+    self.is_scraping = bool(has_single or self._has_active_twitter_instances())
+
+  def _feed_runtime_config(self) -> dict:
+    image_seconds = float((self.feed_image_seconds_var.get() or "10").strip())
+    scroll_pause = float((self.feed_scroll_pause_var.get() or "1.5").strip())
+    scroll_px = int(float((self.feed_scroll_px_var.get() or "900").strip()))
+    max_video_wait = float((self.feed_max_video_wait_var.get() or "300").strip())
+    if image_seconds < 1:
+      raise ValueError("Tiempo por imagen debe ser >= 1")
+    if scroll_pause < 0.2:
+      raise ValueError("Pausa de scroll debe ser >= 0.2")
+    if scroll_px < 100:
+      raise ValueError("Pixeles por scroll debe ser >= 100")
+    if max_video_wait < 5:
+      raise ValueError("Maximo espera de video debe ser >= 5")
+
+    return {
+      "image_seconds": image_seconds,
+      "scroll_pause": scroll_pause,
+      "scroll_px": scroll_px,
+      "max_video_wait": max_video_wait,
+    }
+
+  def _find_monitor_by_id(self, monitor_id: int) -> dict | None:
+    for monitor in self.monitors:
+      if int(monitor.get("id", -1)) == int(monitor_id):
+        return monitor
+    return None
+
+  def _cookie_pool_default_dir(self) -> str:
+    base_dir = os.path.dirname(os.path.dirname(__file__))
+    candidates = [
+      os.path.join(base_dir, "downloader", "cookies", "twitter"),
+      os.path.join(base_dir, "downloader", "cookies"),
+      os.path.join(base_dir, "cookies"),
+    ]
+    for candidate in candidates:
+      if os.path.isdir(candidate):
+        return candidate
+    return candidates[0]
+
+  def _cookie_pool_files(self) -> list[str]:
+    manual = (self.cookies_file_var.get() or "").strip()
+    folder = (self.cookies_folder_var.get() or "").strip()
+    if not folder:
+      folder = self._cookie_pool_default_dir()
+      self.cookies_folder_var.set(folder)
+
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add_file(path: str) -> None:
+      clean = (path or "").strip()
+      if not clean or not os.path.isfile(clean):
+        return
+      key = os.path.normcase(os.path.abspath(clean))
+      if key in seen:
+        return
+      seen.add(key)
+      out.append(clean)
+
+    if manual:
+      add_file(manual)
+
+    if os.path.isdir(folder):
+      try:
+        for name in sorted(os.listdir(folder), key=lambda item: item.lower()):
+          lower = name.lower()
+          if (lower.endswith(".txt") or lower.endswith(".json")) and "cookie" in lower:
+            add_file(os.path.join(folder, name))
+      except Exception:
+        pass
+
+    return out
+
+  def pick_cookies_folder(self) -> None:
+    initial = (self.cookies_folder_var.get() or "").strip() or self._cookie_pool_default_dir()
+    selected = filedialog.askdirectory(initialdir=initial)
+    if selected:
+      self.cookies_folder_var.set(selected)
+      pool = self._cookie_pool_files()
+      self.log(f"Carpeta cookies activa: {selected} ({len(pool)} archivo(s))")
+      self._refresh_x_instances_ui()
+
+  def _cookie_label(self, path: str) -> str:
+    if not path:
+      return "Sin cookies"
+    name = os.path.basename(path)
+    folder = os.path.basename(os.path.dirname(path))
+    return f"{name} ({folder})"
+
+  def _open_instance_start_menu(self, monitor_id: int, anchor_widget) -> None:
+    monitor = self._find_monitor_by_id(monitor_id)
+    if not monitor:
+      return
+
+    menu = tk.Menu(self.root, tearoff=0)
+    menu.add_command(
+      label="Seleccionar: sin cookies",
+      command=lambda: self._set_monitor_cookie_choice(monitor_id, ""),
+    )
+    pool = self._cookie_pool_files()
+    if pool:
+      menu.add_separator()
+      for cookie_file in pool:
+        menu.add_command(
+          label=f"Seleccionar: {self._cookie_label(cookie_file)}",
+          command=lambda chosen=cookie_file: self._set_monitor_cookie_choice(monitor_id, chosen),
+        )
+    menu.add_separator()
+    menu.add_command(label="Elegir cookies manualmente...", command=lambda: self._choose_cookie_for_monitor(monitor_id))
+
+    x = anchor_widget.winfo_rootx()
+    y = anchor_widget.winfo_rooty() + anchor_widget.winfo_height()
+    try:
+      menu.tk_popup(x, y)
+    finally:
+      menu.grab_release()
+
+  def _set_monitor_cookie_choice(self, monitor_id: int, cookie_file: str) -> None:
+    self.twitter_monitor_cookie_choice[int(monitor_id)] = (cookie_file or "").strip()
+    self._refresh_x_instances_ui()
+
+  def _selected_cookie_for_monitor(self, monitor_id: int) -> str:
+    return (self.twitter_monitor_cookie_choice.get(int(monitor_id), "") or "").strip()
+
+  def _choose_cookie_for_monitor(self, monitor_id: int) -> None:
+    initial_dir = (self.cookies_folder_var.get() or "").strip() or self._cookie_pool_default_dir()
+    selected = filedialog.askopenfilename(
+      title="Selecciona cookies para monitor",
+      initialdir=initial_dir,
+      filetypes=[("Cookies", "*.txt *.json"), ("Todos", "*.*")],
+    )
+    if selected:
+      self._set_monitor_cookie_choice(monitor_id, selected)
+
+  def _start_twitter_feed_instance(self, monitor_id: int, selected_cookie_file: str | None = None) -> None:
+    monitor = self._find_monitor_by_id(monitor_id)
+    if not monitor:
+      messagebox.showerror(APP_TITLE, f"No se encontro monitor {monitor_id}")
+      return
+
+    try:
+      cfg = self._feed_runtime_config()
+    except Exception as exc:
+      messagebox.showerror(APP_TITLE, f"Configuracion de feed invalida: {exc}")
+      return
+
+    instance_id = self.twitter_instance_seq
+    self.twitter_instance_seq += 1
+    instance_name = f"X#{instance_id}"
+    chosen_cookie = (selected_cookie_file or "").strip() or self._selected_cookie_for_monitor(monitor_id)
+    cookie_candidates = [chosen_cookie] if chosen_cookie else []
+
+    scraper = FeedScraper(
+      self.download_from_feed,
+      poll_seconds=cfg["scroll_pause"],
+      scroll_px=cfg["scroll_px"],
+      cookies_file=chosen_cookie or (self.cookies_file_var.get() or "").strip(),
+      image_dwell_seconds=cfg["image_seconds"],
+      scroll_pause_seconds=cfg["scroll_pause"],
+      wait_video_end=self.feed_wait_video_end_var.get(),
+      max_video_wait_seconds=cfg["max_video_wait"],
+      only_visible=True,
+      start_maximized=True,
+      tiktok_likes_only=self.feed_tiktok_likes_only_var.get(),
+      cookie_candidates=cookie_candidates,
+      monitor_bounds={
+        "left": int(monitor.get("left", 0)),
+        "top": int(monitor.get("top", 0)),
+        "width": int(monitor.get("width", 0)),
+        "height": int(monitor.get("height", 0)),
+      },
+      instance_name=instance_name,
+    )
+    scraper.set_log_callback(self.log)
+    scraper.start("twitter")
+
+    with self.twitter_instances_lock:
+      self.twitter_instances[instance_id] = {
+        "id": instance_id,
+        "name": instance_name,
+        "monitor_id": int(monitor.get("id", 0)),
+        "monitor_label": str(monitor.get("label") or f"Monitor {monitor_id}"),
+        "cookie_file": chosen_cookie,
+        "scraper": scraper,
+      }
+
+    if chosen_cookie:
+      self.log(f"Instancia {instance_name} iniciada en {monitor.get('label')} con cookies: {self._cookie_label(chosen_cookie)}")
+    else:
+      self.log(f"Instancia {instance_name} iniciada en {monitor.get('label')} (sin cookies dedicadas)")
+    self._update_scraping_state()
+    self._refresh_x_instances_ui()
+
+    if not self.feed_worker_running:
+      self.feed_worker_running = True
+      threading.Thread(target=self._feed_download_worker, daemon=True).start()
+
+  def _get_instance_item(self, instance_id: int) -> dict | None:
+    with self.twitter_instances_lock:
+      return self.twitter_instances.get(int(instance_id))
+
+  def _pause_resume_instance(self, instance_id: int) -> None:
+    item = self._get_instance_item(instance_id)
+    if not item:
+      return
+    scraper = item.get("scraper")
+    if not scraper:
+      return
+    scraper.toggle_pause()
+    self._refresh_x_instances_ui()
+
+  def _toggle_mute_instance(self, instance_id: int) -> None:
+    item = self._get_instance_item(instance_id)
+    if not item:
+      return
+    scraper = item.get("scraper")
+    if not scraper:
+      return
+    scraper.toggle_muted()
+    self._refresh_x_instances_ui()
+
+  def _skip_instance(self, instance_id: int) -> None:
+    item = self._get_instance_item(instance_id)
+    if not item:
+      return
+    scraper = item.get("scraper")
+    if scraper:
+      scraper.request_skip()
+      self.log(f"Skip solicitado para {item.get('name')}")
+
+  def _stop_instance(self, instance_id: int) -> None:
+    with self.twitter_instances_lock:
+      item = self.twitter_instances.pop(int(instance_id), None)
+    if not item:
+      return
+    scraper = item.get("scraper")
+    try:
+      if scraper:
+        scraper.stop()
+    except Exception as exc:
+      self.log(f"Aviso stop instancia {item.get('name')}: {exc}")
+    self.log(f"Instancia {item.get('name')} detenida")
+    self._update_scraping_state()
+    self._refresh_x_instances_ui()
+
+  def _kill_instance(self, instance_id: int) -> None:
+    with self.twitter_instances_lock:
+      item = self.twitter_instances.pop(int(instance_id), None)
+    if not item:
+      return
+    scraper = item.get("scraper")
+    try:
+      if scraper:
+        scraper.kill()
+    except Exception as exc:
+      self.log(f"Aviso kill instancia {item.get('name')}: {exc}")
+    self.log(f"Instancia {item.get('name')} finalizada (kill)")
+    self._update_scraping_state()
+    self._refresh_x_instances_ui()
+
+  def _kill_all_twitter_instances(self) -> None:
+    with self.twitter_instances_lock:
+      ids = list(self.twitter_instances.keys())
+    for instance_id in ids:
+      self._kill_instance(instance_id)
+    self.log("Kill global aplicado a instancias X")
+
+  def _skip_all_twitter_instances(self) -> None:
+    with self.twitter_instances_lock:
+      items = list(self.twitter_instances.values())
+    for item in items:
+      scraper = item.get("scraper")
+      if scraper and scraper.is_running():
+        scraper.request_skip()
+    if items:
+      self.log("Skip global aplicado a instancias X")
+
+  def _set_instance_fullscreen(self, instance_id: int, enabled: bool | None = None) -> None:
+    item = self._get_instance_item(instance_id)
+    if not item:
+      return
+    scraper = item.get("scraper")
+    if not scraper:
+      return
+    if enabled is None:
+      scraper.toggle_window_fullscreen()
+    else:
+      scraper.set_window_fullscreen(bool(enabled))
+    self._refresh_x_instances_ui()
+
+  def _set_all_instances_fullscreen(self, enabled: bool) -> None:
+    with self.twitter_instances_lock:
+      items = list(self.twitter_instances.values())
+    changed = 0
+    for item in items:
+      scraper = item.get("scraper")
+      if not scraper or not scraper.is_running():
+        continue
+      scraper.set_window_fullscreen(enabled)
+      changed += 1
+    if changed:
+      self.log("F11 global aplicado a instancias X" if enabled else "Salir F11 global aplicado a instancias X")
+    self._refresh_x_instances_ui()
+
+  def _prune_dead_twitter_instances(self) -> None:
+    removed: list[str] = []
+    with self.twitter_instances_lock:
+      stale_ids = []
+      for instance_id, item in self.twitter_instances.items():
+        scraper = item.get("scraper")
+        if scraper and scraper.is_running():
+          continue
+        stale_ids.append(instance_id)
+      for instance_id in stale_ids:
+        item = self.twitter_instances.pop(instance_id, None)
+        if item:
+          removed.append(str(item.get("name") or f"X#{instance_id}"))
+    for name in removed:
+      self.log(f"Instancia finalizada: {name}")
+    if removed:
+      self._update_scraping_state()
+
+  def _refresh_x_instances_ui_tick(self) -> None:
+    try:
+      self._prune_dead_twitter_instances()
+      self._refresh_x_instances_ui()
+    finally:
+      self.root.after(1500, self._refresh_x_instances_ui_tick)
+
+  def _refresh_x_instances_ui(self) -> None:
+    panel = self.x_instances_panel
+    table = self.x_instances_table
+    if panel is None or table is None:
+      return
+    if not panel.winfo_exists() or not table.winfo_exists():
+      return
+
+    with self.twitter_instances_lock:
+      items = sorted(self.twitter_instances.values(), key=lambda row: int(row.get("id", 0)))
+
+    monitor_cookie_signature = tuple(
+      (
+        int(monitor.get("id", 0)),
+        self._selected_cookie_for_monitor(int(monitor.get("id", 0))),
+      )
+      for monitor in self.monitors
+    )
+    pool_count = len(self._cookie_pool_files())
+
+    items_signature = tuple(
+      (
+        int(item.get("id", 0)),
+        str(item.get("monitor_label") or ""),
+        str(item.get("cookie_file") or ""),
+        bool(item.get("scraper") and item.get("scraper").is_running()),
+        bool(item.get("scraper") and item.get("scraper").is_paused()),
+        bool(item.get("scraper") and item.get("scraper").is_muted()),
+        bool(item.get("scraper") and item.get("scraper").is_window_fullscreen()),
+      )
+      for item in items
+    )
+    signature = (monitor_cookie_signature, pool_count, items_signature)
+
+    if not panel.winfo_manager():
+      if self.log_frame_widget is not None:
+        panel.pack(fill="x", pady=(0, 10), before=self.log_frame_widget)
+      else:
+        panel.pack(fill="x", pady=(0, 10))
+
+    if self.x_instances_signature == signature:
+      return
+    self.x_instances_signature = signature
+
+    for child in table.winfo_children():
+      child.destroy()
+
+    title_row = ttk.Frame(table)
+    title_row.pack(fill="x", pady=(0, 6))
+    ttk.Label(
+      title_row,
+      text="Gestion de instancias de Feed X por monitor",
+      font=("Segoe UI Semibold", 10),
+      foreground="#0f172a",
+    ).pack(side="left")
+    ttk.Label(
+      title_row,
+      text=f"Cookies detectadas: {pool_count}",
+      foreground="#475569",
+    ).pack(side="right")
+
+    monitors_box = ttk.Frame(table)
+    monitors_box.pack(fill="x", pady=(0, 10))
+    for monitor in self.monitors:
+      row = ttk.Frame(monitors_box)
+      row.pack(fill="x", pady=2)
+      monitor_id = int(monitor.get("id", 0))
+      selected_cookie = self._selected_cookie_for_monitor(monitor_id)
+      cookie_text = self._cookie_label(selected_cookie)
+
+      ttk.Label(row, text=str(monitor.get("label") or "Monitor")).pack(side="left", padx=(0, 8))
+      ttk.Label(row, text=f"Cookie seleccionada: {cookie_text}", foreground="#475569").pack(side="left", padx=(0, 8))
+      trigger = ttk.Button(
+        row,
+        text="☰",
+        style="Subtle.TButton",
+        width=3,
+        command=lambda: None,
+      )
+      trigger.configure(command=lambda m_id=monitor_id, btn=trigger: self._open_instance_start_menu(m_id, btn))
+      trigger.pack(side="left", padx=(0, 6))
+      ttk.Button(
+        row,
+        text="Iniciar",
+        style="Accent.TButton",
+        command=lambda m_id=monitor_id: self._start_twitter_feed_instance(m_id),
+      ).pack(side="left")
+
+    global_row = ttk.Frame(table)
+    global_row.pack(fill="x", pady=(0, 8))
+    ttk.Button(global_row, text="Skip global", style="Subtle.TButton", command=self._skip_all_twitter_instances).pack(side="left", padx=(0, 8))
+    ttk.Button(global_row, text="F11 global", style="Subtle.TButton", command=lambda: self._set_all_instances_fullscreen(True)).pack(side="left", padx=(0, 8))
+    ttk.Button(global_row, text="Salir F11 global", style="Subtle.TButton", command=lambda: self._set_all_instances_fullscreen(False)).pack(side="left", padx=(0, 8))
+    ttk.Button(global_row, text="Kill global", style="Danger.TButton", command=self._kill_all_twitter_instances).pack(side="left")
+
+    for item in items:
+      scraper = item.get("scraper")
+      instance_id = int(item.get("id", 0))
+      name = str(item.get("name") or f"X#{instance_id}")
+      monitor_label = str(item.get("monitor_label") or "Monitor")
+      running = bool(scraper and scraper.is_running())
+      paused = bool(scraper and scraper.is_paused())
+      muted = bool(scraper and scraper.is_muted())
+      fullscreen = bool(scraper and scraper.is_window_fullscreen())
+      status = "Activo"
+      if paused:
+        status = "Pausado"
+      if not running:
+        status = "Detenido"
+      cookie_text = self._cookie_label(str(item.get("cookie_file") or ""))
+
+      card = ttk.Frame(table)
+      card.pack(fill="x", pady=3)
+      left = ttk.Frame(card)
+      left.pack(side="left", fill="x", expand=True)
+      ttk.Label(left, text=f"{name} - {monitor_label}", font=("Segoe UI Semibold", 9)).pack(side="top", anchor="w")
+      ttk.Label(left, text=f"Estado: {status} | Audio: {'Mute' if muted else 'On'} | Ventana: {'F11' if fullscreen else 'Max'}").pack(side="top", anchor="w")
+      ttk.Label(left, text=f"Cookie: {cookie_text}", foreground="#475569").pack(side="top", anchor="w")
+
+      controls = ttk.Frame(card)
+      controls.pack(side="right")
+
+      pause_text = "Reanudar" if paused else "Pausar"
+      mute_text = "Unmute" if muted else "Mute"
+      screen_text = "Salir F11" if fullscreen else "F11"
+
+      ttk.Button(controls, text=pause_text, style="Subtle.TButton", command=lambda iid=instance_id: self._pause_resume_instance(iid)).pack(side="left", padx=2)
+      ttk.Button(controls, text=mute_text, style="Subtle.TButton", command=lambda iid=instance_id: self._toggle_mute_instance(iid)).pack(side="left", padx=2)
+      ttk.Button(controls, text=screen_text, style="Subtle.TButton", command=lambda iid=instance_id: self._set_instance_fullscreen(iid)).pack(side="left", padx=2)
+      ttk.Button(controls, text="Skip", style="Subtle.TButton", command=lambda iid=instance_id: self._skip_instance(iid)).pack(side="left", padx=2)
+      ttk.Button(controls, text="Detener", style="Danger.TButton", command=lambda iid=instance_id: self._stop_instance(iid)).pack(side="left", padx=2)
+      ttk.Button(controls, text="Kill", style="Danger.TButton", command=lambda iid=instance_id: self._kill_instance(iid)).pack(side="left", padx=2)
 
   def _startup_cmd_path(self) -> str:
     appdata = os.environ.get("APPDATA", "").strip()
@@ -369,6 +977,8 @@ class DownloaderApp:
     url: str,
     prefer_image_output: bool = False,
     creator_hint: str | None = None,
+    media_kind: str | None = None,
+    media_urls: list[str] | None = None,
   ) -> None:
     clean = (url or "").strip()
     if not clean:
@@ -383,6 +993,8 @@ class DownloaderApp:
         "url": clean,
         "prefer_image_output": bool(prefer_image_output),
         "creator_hint": (creator_hint or "").strip(),
+        "media_kind": (media_kind or "").strip(),
+        "media_urls": [str(item).strip() for item in (media_urls or []) if str(item).strip()],
       }
     )
     self.log(f"Encolado para descarga automatica: {clean}")
@@ -391,8 +1003,19 @@ class DownloaderApp:
       self.feed_worker_running = True
       threading.Thread(target=self._feed_download_worker, daemon=True).start()
 
-  def download_from_feed(self, url: str) -> None:
-    self._queue_feed_download(url, prefer_image_output=False, creator_hint=None)
+  def download_from_feed(self, payload) -> None:
+    if isinstance(payload, dict):
+      url = str(payload.get("url") or "").strip()
+      self._queue_feed_download(
+        url,
+        prefer_image_output=bool(payload.get("prefer_image_output", False)),
+        creator_hint=str(payload.get("creator_hint") or "").strip() or None,
+        media_kind=str(payload.get("media_kind") or "").strip() or None,
+        media_urls=list(payload.get("media_urls") or []),
+      )
+      return
+
+    self._queue_feed_download(str(payload or "").strip(), prefer_image_output=False, creator_hint=None)
 
   def _feed_download_worker(self) -> None:
     self.log("Worker de feed iniciado")
@@ -410,21 +1033,30 @@ class DownloaderApp:
             url = str(payload.get("url") or "").strip()
             prefer_image_output = bool(payload.get("prefer_image_output", False))
             creator_hint = str(payload.get("creator_hint") or "").strip() or None
+            media_kind = str(payload.get("media_kind") or "").strip().lower()
+            media_urls = [str(item).strip() for item in (payload.get("media_urls") or []) if str(item).strip()]
           else:
             url = str(payload or "").strip()
             prefer_image_output = False
             creator_hint = None
+            media_kind = ""
+            media_urls = []
 
           if not url:
             continue
 
           is_twitter = self._is_twitter_url(url)
           if is_twitter:
-            media_probe = self._probe_twitter_status_media(url)
-            if not creator_hint and media_probe.get("author_handle"):
-              creator_hint = str(media_probe.get("author_handle") or "").strip() or None
-            if bool(media_probe.get("has_image", False)) and not bool(media_probe.get("has_video", False)):
+            if not creator_hint:
+              creator_hint = self._twitter_creator_from_url(url)
+            if media_kind in {"image", "carousel"} or media_urls:
               prefer_image_output = True
+            if not (media_kind in {"image", "carousel"} or media_urls):
+              media_probe = self._probe_twitter_status_media(url)
+              if not creator_hint and media_probe.get("author_handle"):
+                creator_hint = str(media_probe.get("author_handle") or "").strip() or None
+              if bool(media_probe.get("has_image", False)) and not bool(media_probe.get("has_video", False)):
+                prefer_image_output = True
 
           if prefer_image_output:
             feed_out_dir = self._build_image_output_dir(url, creator_hint=creator_hint)
@@ -434,30 +1066,48 @@ class DownloaderApp:
 
           feed_output_template = os.path.join(feed_out_dir, DEFAULT_OUTPUT_TEMPLATE)
           if is_twitter:
+            if prefer_image_output and media_urls:
+              saved = self._download_twitter_media_urls(media_urls, feed_out_dir)
+              if saved:
+                self._remember_downloaded_status(url)
+                self.log(f"OK feed: {url}")
+                continue
+
             self.log("Feed Twitter/X: intentando primero con gallery-dl (mejor para imagenes/carruseles)...")
             ok, detail = self._gallery_dl_download(url, out_dir=feed_out_dir)
             if ok:
               self._remember_downloaded_status(url)
               self.log(f"OK feed: {url}")
               continue
-            self.log(f"Feed Twitter/X: gallery-dl no pudo extraer este item ({detail}). Reintentando con yt-dlp...")
+            self.log(f"Feed Twitter/X: gallery-dl no pudo extraer este item ({detail}).")
+
+            if prefer_image_output:
+              raise RuntimeError(f"No se pudo descargar imagen/carrusel. Detalle gallery-dl: {detail}")
+            self.log("Feed Twitter/X: reintentando con yt-dlp...")
 
           compression_args = self._compression_postprocessor_args()
-          specific_args = [
-            "-f",
-            self._language_format_selector(),
-            "--merge-output-format",
-            "mp4",
-            "-o",
-            feed_output_template,
-          ]
-          if compression_args:
-            specific_args += ["--recode-video", "mp4", "--postprocessor-args", compression_args]
+          strict_video_mode = not prefer_image_output
+          if strict_video_mode:
+            specific_args = [
+              "-f",
+              self._language_format_selector(),
+              "--merge-output-format",
+              "mp4",
+              "-o",
+              feed_output_template,
+            ]
+            if compression_args:
+              specific_args += ["--recode-video", "mp4", "--postprocessor-args", compression_args]
+          else:
+            specific_args = ["-o", feed_output_template]
+            self.log("Feed Twitter/X: ruta de imagen/carrusel detectada, omitiendo modo estricto de video.")
 
           self.log(f"Descargando desde feed: {url}")
           try:
             self._run_yt_dlp_download(url, specific_args, allow_social_fallback=True)
           except Exception as strict_exc:
+            if not strict_video_mode:
+              raise
             self.log(
               "Feed: modo video/audio no aplico para este item. "
               "Reintentando en modo compatible (incluye imagenes)."
@@ -1474,44 +2124,53 @@ class DownloaderApp:
         return
 
     try:
-      image_seconds = float((self.feed_image_seconds_var.get() or "10").strip())
-      scroll_pause = float((self.feed_scroll_pause_var.get() or "1.5").strip())
-      scroll_px = int(float((self.feed_scroll_px_var.get() or "900").strip()))
-      max_video_wait = float((self.feed_max_video_wait_var.get() or "300").strip())
-      if image_seconds < 1:
-        raise ValueError("Tiempo por imagen debe ser >= 1")
-      if scroll_pause < 0.2:
-        raise ValueError("Pausa de scroll debe ser >= 0.2")
-      if scroll_px < 100:
-        raise ValueError("Pixeles por scroll debe ser >= 100")
-      if max_video_wait < 5:
-        raise ValueError("Maximo espera de video debe ser >= 5")
+      cfg = self._feed_runtime_config()
     except Exception as exc:
       messagebox.showerror(APP_TITLE, f"Configuracion de feed invalida: {exc}")
+      return
+
+    clean_platform = (platform or "").strip().lower()
+    if clean_platform == "twitter":
+      primary = next((m for m in self.monitors if bool(m.get("primary", False))), None)
+      default_monitor_id = int((primary or self.monitors[0]).get("id", 1))
+      self._start_twitter_feed_instance(default_monitor_id)
       return
     
     self.is_scraping = True
     self.scraper = FeedScraper(
       self.download_from_feed,
-      poll_seconds=scroll_pause,
-      scroll_px=scroll_px,
+      poll_seconds=cfg["scroll_pause"],
+      scroll_px=cfg["scroll_px"],
       cookies_file=(self.cookies_file_var.get() or "").strip(),
-      image_dwell_seconds=image_seconds,
-      scroll_pause_seconds=scroll_pause,
+      image_dwell_seconds=cfg["image_seconds"],
+      scroll_pause_seconds=cfg["scroll_pause"],
       wait_video_end=self.feed_wait_video_end_var.get(),
-      max_video_wait_seconds=max_video_wait,
+      max_video_wait_seconds=cfg["max_video_wait"],
       only_visible=True,
       start_maximized=True,
       tiktok_likes_only=self.feed_tiktok_likes_only_var.get(),
     )
     self.scraper.set_log_callback(self.log)
     self.scraper.start(platform)
+    self._update_scraping_state()
     self.log(f"Scraper iniciado para {platform}")
 
   def stop_feed(self) -> None:
+    stopped_any = False
+
     if self.scraper:
       self.scraper.stop()
-      self.is_scraping = False
+      self.scraper = None
+      stopped_any = True
+
+    with self.twitter_instances_lock:
+      instance_ids = list(self.twitter_instances.keys())
+    for instance_id in instance_ids:
+      self._stop_instance(instance_id)
+      stopped_any = True
+
+    self._update_scraping_state()
+    if stopped_any:
       self.feed_urls_queued.clear()
       while not self.feed_download_queue.empty():
         try:
@@ -1530,7 +2189,7 @@ class DownloaderApp:
     shell = ttk.Frame(self.root)
     shell.pack(fill="both", expand=True)
 
-    canvas = tk.Canvas(shell, highlightthickness=0)
+    canvas = tk.Canvas(shell, highlightthickness=0, bg="#eef2f7")
     v_scroll = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
     h_scroll = ttk.Scrollbar(shell, orient="horizontal", command=canvas.xview)
     canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
@@ -1539,7 +2198,7 @@ class DownloaderApp:
     v_scroll.pack(side="right", fill="y")
     canvas.pack(side="left", fill="both", expand=True)
 
-    main = ttk.Frame(canvas, padding=12)
+    main = ttk.Frame(canvas, padding=16)
     main_window = canvas.create_window((0, 0), window=main, anchor="nw")
 
     def _on_main_configure(_event=None) -> None:
@@ -1588,7 +2247,7 @@ class DownloaderApp:
     lang_combo.bind("<<ComboboxSelected>>", _set_lang)
     lang_combo.pack(side="left")
 
-    top = ttk.LabelFrame(main, text=self._tr("source", "Fuente"))
+    top = ttk.LabelFrame(main, text=self._tr("source", "Fuente"), style="Card.TLabelframe", padding=10)
     top.pack(fill="x", pady=(0, 10))
 
     ttk.Label(top, text="URL:").grid(row=0, column=0, sticky="w", padx=8, pady=8)
@@ -1623,7 +2282,7 @@ class DownloaderApp:
 
     top.columnconfigure(1, weight=1)
 
-    social = ttk.LabelFrame(main, text=self._tr("social", "Redes Sociales"))
+    social = ttk.LabelFrame(main, text=self._tr("social", "Redes Sociales"), style="Card.TLabelframe", padding=10)
     social.pack(fill="x", pady=(0, 10))
 
     ttk.Label(social, text="Instagram URL:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
@@ -1656,7 +2315,7 @@ class DownloaderApp:
 
     social.columnconfigure(1, weight=1)
 
-    cfg = ttk.LabelFrame(main, text=self._tr("options", "Opciones"))
+    cfg = ttk.LabelFrame(main, text=self._tr("options", "Opciones"), style="Card.TLabelframe", padding=10)
     cfg.pack(fill="x", pady=(0, 10))
 
     ttk.Label(cfg, text="Tamano objetivo (MB):").grid(row=0, column=0, sticky="w", padx=8, pady=6)
@@ -1756,26 +2415,29 @@ class DownloaderApp:
     ttk.Label(cfg, text="cookies.txt:").grid(row=6, column=0, sticky="w", padx=8, pady=6)
     ttk.Entry(cfg, textvariable=self.cookies_file_var, width=42).grid(row=6, column=1, columnspan=3, sticky="ew", padx=8, pady=6)
     ttk.Button(cfg, text="Elegir cookies", command=self.pick_cookies_file).grid(row=6, column=4, padx=8, pady=6)
+    ttk.Label(cfg, text="Carpeta cookies:").grid(row=7, column=0, sticky="w", padx=8, pady=6)
+    ttk.Entry(cfg, textvariable=self.cookies_folder_var, width=42).grid(row=7, column=1, columnspan=3, sticky="ew", padx=8, pady=6)
+    ttk.Button(cfg, text="Elegir carpeta", command=self.pick_cookies_folder).grid(row=7, column=4, padx=8, pady=6)
 
-    actions = ttk.LabelFrame(main, text=self._tr("downloads", "Descargas"))
+    actions = ttk.LabelFrame(main, text=self._tr("downloads", "Descargas"), style="Card.TLabelframe", padding=10)
     actions.pack(fill="x", pady=(0, 10))
 
-    ttk.Button(actions, text=self._tr("best", "BEST (audio+video)"), command=self.download_best).pack(
+    ttk.Button(actions, text=self._tr("best", "BEST (audio+video)"), command=self.download_best, style="Accent.TButton").pack(
       side="left", padx=8, pady=10
     )
-    ttk.Button(actions, text=self._tr("audio_only", "Solo audio"), command=self.download_audio_only).pack(
+    ttk.Button(actions, text=self._tr("audio_only", "Solo audio"), command=self.download_audio_only, style="Subtle.TButton").pack(
       side="left", padx=8, pady=10
     )
-    ttk.Button(actions, text=self._tr("video_only", "Solo video"), command=self.download_video_only).pack(
+    ttk.Button(actions, text=self._tr("video_only", "Solo video"), command=self.download_video_only, style="Subtle.TButton").pack(
       side="left", padx=8, pady=10
     )
-    ttk.Button(actions, text="Limitar tamano", command=self.download_limited_size).pack(
+    ttk.Button(actions, text="Limitar tamano", command=self.download_limited_size, style="Subtle.TButton").pack(
       side="left", padx=8, pady=10
     )
-    ttk.Button(actions, text="Recortar segmento", command=self.download_trimmed).pack(
+    ttk.Button(actions, text="Recortar segmento", command=self.download_trimmed, style="Subtle.TButton").pack(
       side="left", padx=8, pady=10
     )
-    ttk.Button(actions, text=self._tr("restart_app", "Reiniciar app"), command=self.restart_application).pack(
+    ttk.Button(actions, text=self._tr("restart_app", "Reiniciar app"), command=self.restart_application, style="Danger.TButton").pack(
       side="left", padx=8, pady=10
     )
     ttk.Checkbutton(
@@ -1790,7 +2452,7 @@ class DownloaderApp:
       variable=self.clipboard_monitor_var,
     ).pack(side="left", padx=14, pady=10)
 
-    feed = ttk.LabelFrame(main, text=self._tr("feed", "Feed Automático"))
+    feed = ttk.LabelFrame(main, text=self._tr("feed", "Feed Automático"), style="Card.TLabelframe", padding=10)
     feed.pack(fill="x", pady=(0, 10))
 
     for col in range(6):
@@ -1840,41 +2502,59 @@ class DownloaderApp:
 
     ttk.Label(feed, text="Ruta descarga: usa campo 'Salida' arriba").grid(row=6, column=0, columnspan=6, sticky="w", padx=8, pady=6)
 
-    ttk.Button(feed, text="Iniciar Feed IG", command=lambda: self.start_feed("instagram")).grid(
+    ttk.Button(feed, text="Iniciar Feed IG", command=lambda: self.start_feed("instagram"), style="Accent.TButton").grid(
       row=7, column=0, padx=8, pady=8, sticky="ew"
     )
-    ttk.Button(feed, text="Iniciar Feed TikTok", command=lambda: self.start_feed("tiktok")).grid(
+    ttk.Button(feed, text="Iniciar Feed TikTok", command=lambda: self.start_feed("tiktok"), style="Accent.TButton").grid(
       row=7, column=1, padx=8, pady=8, sticky="ew"
     )
-    ttk.Button(feed, text="Iniciar Feed Twitter/X", command=lambda: self.start_feed("twitter")).grid(
+    ttk.Button(feed, text="Iniciar Feed Twitter/X", command=lambda: self.start_feed("twitter"), style="Accent.TButton").grid(
       row=7, column=2, padx=8, pady=8, sticky="ew"
     )
-    ttk.Button(feed, text=self._tr("feed_yt", "Iniciar Feed YouTube Shorts"), command=lambda: self.start_feed("youtube")).grid(
+    ttk.Button(feed, text=self._tr("feed_yt", "Iniciar Feed YouTube Shorts"), command=lambda: self.start_feed("youtube"), style="Accent.TButton").grid(
       row=7, column=3, padx=8, pady=8, sticky="ew"
     )
-    ttk.Button(feed, text=self._tr("stop_feed", "STOP Feed"), command=self.stop_feed).grid(
+    ttk.Button(feed, text=self._tr("stop_feed", "STOP Feed"), command=self.stop_feed, style="Danger.TButton").grid(
       row=7, column=4, padx=8, pady=8, sticky="ew"
     )
-    ttk.Button(feed, text=self._tr("live_log", "Ver log en vivo"), command=self.open_live_log_window).grid(
+    ttk.Button(feed, text=self._tr("live_log", "Ver log en vivo"), command=self.open_live_log_window, style="Subtle.TButton").grid(
       row=7, column=5, padx=8, pady=8, sticky="ew"
     )
 
-    ttk.Button(feed, text="Iniciar Monitor X", command=self.start_x_actions_monitor).grid(
+    ttk.Button(feed, text="Iniciar Monitor X", command=self.start_x_actions_monitor, style="Accent.TButton").grid(
       row=8, column=0, columnspan=2, padx=8, pady=8, sticky="ew"
     )
-    ttk.Button(feed, text="Detener Monitor X", command=self.stop_x_actions_monitor).grid(
+    ttk.Button(feed, text="Detener Monitor X", command=self.stop_x_actions_monitor, style="Danger.TButton").grid(
       row=8, column=2, columnspan=2, padx=8, pady=8, sticky="ew"
     )
 
-    log_frame = ttk.LabelFrame(main, text=self._tr("log", "Log"))
-    log_frame.pack(fill="both", expand=True)
+    self.x_instances_panel = ttk.LabelFrame(main, text="Instancias Feed X", style="Card.TLabelframe", padding=10)
+    self.x_instances_table = ttk.Frame(self.x_instances_panel)
+    self.x_instances_table.pack(fill="x")
+    self.x_instances_signature = None
 
-    self.log_widget = tk.Text(log_frame, height=20, wrap="word")
+    log_frame = ttk.LabelFrame(main, text=self._tr("log", "Log"), style="Card.TLabelframe", padding=10)
+    log_frame.pack(fill="both", expand=True)
+    self.log_frame_widget = log_frame
+
+    self.log_widget = tk.Text(
+      log_frame,
+      height=20,
+      wrap="word",
+      bg="#0f172a",
+      fg="#e2e8f0",
+      insertbackground="#e2e8f0",
+      relief="flat",
+      padx=10,
+      pady=8,
+    )
     self.log_widget.pack(side="left", fill="both", expand=True)
 
     scrollbar = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_widget.yview)
     scrollbar.pack(side="right", fill="y")
     self.log_widget.configure(yscrollcommand=scrollbar.set)
+
+    self._refresh_x_instances_ui()
 
     _on_main_configure()
 
@@ -2058,7 +2738,14 @@ class DownloaderApp:
         target = f"{base}_{idx}{ext}"
         idx += 1
 
-      with urlopen(url, timeout=30) as resp:
+      request = Request(
+        url,
+        headers={
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+          "Referer": "https://x.com/",
+        },
+      )
+      with urlopen(request, timeout=30) as resp:
         content_type = (resp.headers.get("Content-Type") or "").lower()
         if "image/" not in content_type:
           return None
@@ -2068,6 +2755,21 @@ class DownloaderApp:
       return target
     except Exception:
       return None
+
+  def _download_twitter_media_urls(self, media_urls: list[str], out_dir: str) -> list[str]:
+    saved: list[str] = []
+    for media_url in media_urls:
+      clean = (media_url or "").strip()
+      if not clean:
+        continue
+      if not self._looks_like_image_url(clean):
+        continue
+      saved_path = self._download_direct_image(clean, out_dir)
+      if saved_path:
+        saved.append(saved_path)
+    if saved:
+      self.log(f"Imagenes descargadas directo: {len(saved)} archivo(s)")
+    return saved
 
   def _download_image_url_internal(self, url: str, source_label: str) -> None:
     def task() -> None:
@@ -2185,19 +2887,20 @@ class DownloaderApp:
       self.output_dir_var.set(selected)
 
   def pick_cookies_file(self) -> None:
-    base_dir = os.path.dirname(os.path.dirname(__file__))
-    cookies_dir = os.path.join(base_dir, "downloader", "cookies")
-    initial_dir = cookies_dir if os.path.isdir(cookies_dir) else os.path.join(base_dir, "downloader")
+    initial_dir = (self.cookies_folder_var.get() or "").strip() or self._cookie_pool_default_dir()
 
     selected = filedialog.askopenfilename(
       title="Selecciona archivo cookies.txt",
       initialdir=initial_dir,
-      filetypes=[("Cookies", "*.txt"), ("Todos", "*.*")],
+      filetypes=[("Cookies", "*.txt *.json"), ("Todos", "*.*")],
     )
     if selected:
       self.cookies_file_var.set(selected)
+      self.cookies_folder_var.set(os.path.dirname(selected))
 
   def _auto_load_default_cookies_file(self) -> None:
+    if not (self.cookies_folder_var.get() or "").strip():
+      self.cookies_folder_var.set(self._cookie_pool_default_dir())
     candidates = self._existing_cookie_files()
     if not candidates:
       return
@@ -2208,15 +2911,15 @@ class DownloaderApp:
       self.log(f"cookies alterna detectada: {candidates[1]}")
 
   def _existing_cookie_files(self) -> list[str]:
-    import random
     base_dir = os.path.dirname(os.path.dirname(__file__))
     manual = (self.cookies_file_var.get() or "").strip()
+    folder = (self.cookies_folder_var.get() or "").strip()
     
     dirs_to_scan = [
+      folder,
+      os.path.join(base_dir, "downloader", "cookies", "twitter"),
       os.path.join(base_dir, "downloader", "cookies"),
       os.path.join(base_dir, "cookies"),
-      os.path.join(base_dir, "downloader"),
-      base_dir
     ]
 
     out: list[str] = []
@@ -2234,29 +2937,25 @@ class DownloaderApp:
       add_file(manual)
 
     for d in dirs_to_scan:
-      if not os.path.isdir(d):
+      clean_dir = (d or "").strip()
+      if not clean_dir or not os.path.isdir(clean_dir):
         continue
       try:
-        for f in os.listdir(d):
-          # SOLUCIÓN: Solo tomar en cuenta archivos que tengan "cookie" en su nombre
-          # Esto evita cargar requirements.txt o activity.log como si fuesen cookies
-          if f.lower().endswith(".txt") and "cookie" in f.lower():
-            add_file(os.path.join(d, f))
+        for f in sorted(os.listdir(clean_dir), key=lambda item: item.lower()):
+          lower = f.lower()
+          if lower.endswith(".txt") and "cookie" in lower:
+            add_file(os.path.join(clean_dir, f))
       except Exception:
         pass
 
     if out:
-      first = out[0]
-      tail = out[1:]
-      random.shuffle(tail)
-      
-      final_list = [first] + tail
-      
+      final_list = list(out)
+
       last_success = getattr(self, "last_success_cookie_path", None)
       if last_success and last_success in final_list:
         final_list.remove(last_success)
         final_list.insert(0, last_success)
-        
+
       return final_list
 
     return []
@@ -2354,10 +3053,12 @@ class DownloaderApp:
         if existing:
           cookies_file = existing[0]
 
-      if cookies_file and os.path.isfile(cookies_file):
+      if cookies_file and os.path.isfile(cookies_file) and cookies_file.lower().endswith(".txt"):
         if is_social:
           self.log(f"Usando cookies para red social: {cookies_file}")
         args += ["--cookies", cookies_file]
+      elif cookies_file and os.path.isfile(cookies_file):
+        self.log(f"Aviso: formato de cookies no compatible para yt-dlp ({cookies_file}). Usa .txt Netscape.")
       elif self.use_cookies_var.get() and not self.cookies_broken:
         browser = (self.cookies_browser_var.get() or "chrome").strip().lower()
         args += ["--cookies-from-browser", browser]
@@ -2612,10 +3313,12 @@ class DownloaderApp:
       if existing:
         cookies_file = existing[0]
 
-    if cookies_file and os.path.isfile(cookies_file):
+    if cookies_file and os.path.isfile(cookies_file) and cookies_file.lower().endswith(".txt"):
       args += ["--cookies", cookies_file]
       if log_usage:
         self.log(f"gallery-dl usando cookies: {cookies_file}")
+    elif cookies_file and os.path.isfile(cookies_file):
+      self.log(f"Aviso: gallery-dl requiere cookies .txt Netscape. Ignorando: {cookies_file}")
     return args
 
   def _gallery_dl_download(self, url: str, out_dir: str | None = None) -> tuple[bool, str]:
