@@ -3142,6 +3142,7 @@ class DownloaderApp:
     self.log("Comando: " + " ".join(cmd))
     process = subprocess.Popen(
       cmd,
+      stdin=subprocess.DEVNULL,
       stdout=subprocess.PIPE,
       stderr=subprocess.STDOUT,
       text=True,
@@ -3179,6 +3180,7 @@ class DownloaderApp:
     args = [
       "--ignore-config",
       "--no-playlist",
+      "--force-overwrites",
       "--socket-timeout",
       "20",
       "--retries",
@@ -3667,26 +3669,37 @@ class DownloaderApp:
     out = self._build_output_template(url)
 
     def task() -> None:
-      # Unificar argumentos de postprocesado para máxima compatibilidad
-      ffmpeg_args = (
-        f"ffmpeg:-c:v libx264 -b:v 1500k -maxrate 1500k -bufsize 3000k "
-        f"-c:a aac -b:a 128k -movflags +faststart"
-      )
-      compression_args = self._postprocessor_args_for_url(url, ffmpeg_args) or ffmpeg_args
       specific_args = [
         "-f",
         self._language_format_selector(),
         "--merge-output-format",
         "mp4",
-        "--recode-video",
-        "mp4",
-        "--postprocessor-args",
-        compression_args,
         "-o",
         out,
       ]
+
+      compression_args = self._compression_postprocessor_args()
+      requires_reencode = compression_args is not None or self._is_youtube_shorts_url(url)
+      if requires_reencode:
+        # Re-encode only when compression is requested or Shorts aspect-ratio fix needs filters.
+        base_reencode_args = compression_args or (
+          "ffmpeg:-c:v h264_nvenc -cq 22 -preset p5 -threads 0 "
+          "-c:a aac -b:a 128k -movflags +faststart"
+        )
+        post_args = self._postprocessor_args_for_url(url, base_reencode_args) or base_reencode_args
+        specific_args += [
+          "--recode-video",
+          "mp4",
+          "--postprocessor-args",
+          post_args,
+        ]
+
       specific_args += self._subtitle_download_args()
       self.log(f"Modo BEST {source_label.upper()}: no aplica limite de tamano ni recorte")
+      if requires_reencode:
+        self.log("Postprocesado BEST: recodificacion activada (compresion o fix Shorts).")
+      else:
+        self.log("Postprocesado BEST: merge directo sin recodificar para maxima velocidad.")
       if self.include_subtitles_var.get():
         if self.embed_subtitles_var.get():
           self.log("Subtitulos: activados y embebidos en MP4 (se pueden activar/desactivar en reproductor).")
@@ -4017,7 +4030,7 @@ class DownloaderApp:
     elif mode == "alta":
       cq = 28
 
-    return f"ffmpeg:-c:v h264_nvenc -cq {cq} -preset p5 -c:a aac -b:a 128k -movflags +faststart"
+    return f"ffmpeg:-c:v h264_nvenc -cq {cq} -preset p5 -threads 0 -c:a aac -b:a 128k -movflags +faststart"
 
   def _is_youtube_shorts_url(self, url: str) -> bool:
     lower = (url or "").lower()
@@ -4201,7 +4214,7 @@ class DownloaderApp:
       )
 
       ffmpeg_args = (
-        f"ffmpeg:-c:v libx264 -b:v {video_kbps}k "
+        f"ffmpeg:-c:v libx264 -preset veryfast -threads 0 -b:v {video_kbps}k "
         f"-maxrate {video_kbps}k -bufsize {video_kbps * 2}k "
         f"-c:a aac -b:a {audio_kbps}k -movflags +faststart"
       )
@@ -4250,7 +4263,7 @@ class DownloaderApp:
     def task() -> None:
       section = f"*{start}-{end}"
       ffmpeg_args = (
-        f"ffmpeg:-c:v libx264 -b:v 1500k -maxrate 1500k -bufsize 3000k "
+        f"ffmpeg:-c:v libx264 -preset veryfast -threads 0 -b:v 1500k -maxrate 1500k -bufsize 3000k "
         f"-c:a aac -b:a 128k -movflags +faststart"
       )
       compression_args = self._postprocessor_args_for_url(url, ffmpeg_args) or ffmpeg_args

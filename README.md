@@ -35,7 +35,7 @@ Copias de seguridad por si necesitas volver a una version funcional rapidamente.
 ## 3) Ejecucion recomendada (1 click)
 
 Desde la raiz del proyecto, usa:
-- `iniciar-downloader.bat`
+- `launchers\\iniciar-downloader.bat`
 
 Este script:
 1. Detecta Python disponible
