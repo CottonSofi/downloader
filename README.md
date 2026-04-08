@@ -1,42 +1,35 @@
 # Downloader GUI + Feed Scraper
 
-Este documento explica como usar y mantener los archivos principales:
-- `app.py` (aplicacion GUI principal)
-- `feed_scraper.py` (scraper de feed para deteccion automatica)
+## Archivos principales
 
-Tambien incluye las copias de seguridad:
-- `app2.py`
-- `scrapper2.py`
-
-## 1) Que hace cada archivo
-
-### `app.py`
+### `app.py` 🖥️
 Aplicacion principal con interfaz Tkinter para:
 - Descargar enlaces manuales con `yt-dlp`
 - Usar fallback social con `gallery-dl`
-- Manejar cookies (`cookies.txt` y `cookies2.txt`)
-- Iniciar/parar feed automatico (Instagram, TikTok, Twitter/X, YouTube Shorts)
+- Manejar cookies (`cookies.txt`, `cookies2.txt`, carpeta `cookies/`)
+- Iniciar/parar feed automático (Instagram, TikTok, Twitter/X, YouTube Shorts)
+- Configuración persistente en `downloader_settings.json`
 
-### `feed_scraper.py`
-Motor de scraping/automatizacion del feed con Playwright para:
-- Abrir el feed objetivo en navegador
-- Detectar items visibles
+### `feed_scraper.py` 🤖
+Motor de scraping/automatización del feed con Playwright para:
+- Abrir feed en navegador real (visible, no detectable como bot)
+- Detectar videos automáticamente durante scroll
+- Filtrar anuncios ("Sponsored", "Ad", "Patrocinado", etc.)
+- Conservar sesión entre ejecuciones en `browser_profile/`
 - Enviar URLs detectadas a `app.py` para descarga en cola
 
-### `app2.py` y `scrapper2.py`
-Copias de seguridad por si necesitas volver a una version funcional rapidamente.
+### `downloader.py` & `aller.py`
+Utilidades complementarias para procesamiento de enlaces
 
-## 2) Guia de instalacion
+## Instalación
 
-### Requisitos minimos
+### Requisitos mínimos
 
 - Windows 10/11
 - Python 3.10+ (recomendado)
-- Internet en la primera instalacion de dependencias
+- Internet en la primera instalación de dependencias
 
-### Instalacion recomendada
-
-Desde la raiz del proyecto:
+### Recomendado: crear entorno virtual
 
 ```powershell
 python -m venv .venv
@@ -45,99 +38,119 @@ python -m pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-Si ya tienes una `.venv` creada, basta con activarla y reinstalar dependencias si cambias de equipo.
+### Lanzadores en Windows
 
-### Arranque en Windows
+El proyecto incluye lanzadores VBS en `../launchers/` para ejecutar sin consola:
+- `iniciar-downloader.vbs`
+- `iniciar-feed.vbs`
+- `iniciar-aller.vbs`
 
-El proyecto incluye lanzadores ocultos en `launchers/` para evitar abrir ventanas de `cmd`.
-Usa el acceso directo o el script correspondiente, por ejemplo:
+## Ejecución
 
-- `launchers\feed.vbs` para `downloader/app.py`
-- `launchers\downloader.vbs` para `downloader/downloader.py`
-- `launchers\aller.vbs` para `downloader/aller.py`
+### Opción 1: Usar lanzador (recomendado)
+Desde `message/launchers/`, doble-clic en `iniciar-downloader.vbs`
 
-Estos lanzadores usan `pythonw.exe` cuando existe para no mostrar consola.
+### Opción 2: Línea de comando
 
-## 3) Ejecucion recomendada (1 click)
-
-Desde la raiz del proyecto, abre el lanzador correspondiente en `launchers/`.
-La GUI principal es `downloader/app.py`.
-
-## 4) Ejecucion manual
-
-Desde la raiz del proyecto:
-
-```powershell
-python -m pip install -r requirements.txt
-python -m playwright install chromium
-python downloader/app.py
-```
-
-Si usas entorno virtual:
-
+Con entorno virtual:
 ```powershell
 .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
-python -m playwright install chromium
-python downloader/app.py
+python app.py
 ```
 
-## 5) Dependencias
+Sin entorno virtual (requiere dependencias globales):
+```powershell
+python app.py
+```
+
+## Dependencias
 
 El proyecto usa:
-- `yt-dlp`
-- `gallery-dl`
-- `imageio-ffmpeg`
-- `playwright`
+- `yt-dlp` - descarga de videos
+- `gallery-dl` - descarga de imágenes/multimedia (fallback)
+- `imageio-ffmpeg` - procesamiento de video
+- `playwright` - automatización de navegador
 
-Estan declaradas en `requirements.txt`.
+Están declaradas en `requirements.txt`.
 
-Nota: no se recomienda instalar dependencias automaticamente en cada arranque. Si falta algo, la app mostrara un aviso claro para que lo instales en la misma `.venv`.
+## Cookies y autenticación
 
-## 6) Cookies
+El proyecto soporta cookies en la carpeta `cookies/`:
+- `cookies/twitter/` - Cookies X/Twitter
+- `cookies/instagram/` - Instagram cookies
+- `cookies/tiktok/` - TikTok cookies
+- `cookies/youtube/` - YouTube cookies
+- `cookies/general/` - Cookies genéricas
 
-Rutas soportadas automaticamente:
-- `downloader/cookies.txt`
-- `downloader/cookies2.txt`
+La app detecta y selecciona automáticamente según necesidad.
 
-La app detecta principal y alterna. Si una falla, reintenta con la otra en varios flujos.
+**Sesión de navegador**: Se guarda en `browser_profile/` para reutilización entre ejecuciones.
 
-## 7) Logs y diagnostico
+## Automatizador de Feeds 🔥
 
-- Log de actividad: `downloader/activity.log`
-- En la GUI puedes abrir "Ver log en vivo" para inspeccion en tiempo real.
+### ¿Qué es?
 
-Si algo falla, comparte el bloque del log desde el inicio del evento hasta el error para depuracion precisa.
+Extensión que automatiza la descarga de videos desde feeds en tiempo real.
 
-## 8) Recuperacion rapida (backup)
+### Plataformas soportadas
+- **Instagram** - Feed y reels
+- **TikTok** - Feed automático
+- **Twitter/X** - Timeline
+- **YouTube Shorts** - Shorts automático
 
-Si una actualizacion rompe algo:
+### ¿Cómo usar?
 
-1. Cierra la app
-2. Copia backup sobre el archivo principal
-
-Ejemplo:
-
+**PASO 1**: Inicia la app
 ```powershell
-Copy-Item downloader\app2.py downloader\app.py -Force
-Copy-Item downloader\scrapper2.py downloader\feed_scraper.py -Force
+python app.py
 ```
 
-## 9) Estructura recomendada
+**PASO 2**: Verás botones de "Feed Automático" para cada plataforma
 
-Mantener un solo README para este modulo es lo ideal.
+**PASO 3**: DEBES ESTAR LOGUEADO en la plataforma en el navegador que se abre (es visible, no bot)
 
-Ventajas:
-- Menos duplicacion
-- Una sola fuente de verdad
-- Facil mantenimiento
+**PASO 4**: El programa hace:
+```
+1. Navega al feed
+2. Espera carga inicial
+3. Hace scroll automático
+4. Detecta videos
+5. Extrae URLs
+6. Descarga con tu app
+7. Evita duplicados
+8. Continúa scrolling
+```
 
-Si luego el proyecto crece mucho, puedes separar documentacion en:
-- `README.md` principal
-- `docs/feed.md`
-- `docs/troubleshooting.md`
+**PASO 5**: Para detener, haz clic en **STOP Feed**
 
-## 10) Comandos utiles
+### Configuración antes de iniciar feed
+
+- **Compresión**: sin_compresion / baja / media / alta
+- **Cookies.txt**: Si tienes en `cookies/`
+- **Idioma audio**: auto o específico
+- **Calidad**: best o específica (720p, 1080p, etc)
+
+Todas las opciones se aplican automáticamente a cada video descargado.
+
+### Seguridad y detección
+
+El navegador usa **modo visible (headless=False)**:
+- ✅ Abre navegador real (no parece bot)
+- ✅ Conserva sesión entre ejecuciones
+- ✅ Permite login manual si expira
+
+Anuncios ignorados automáticamente:
+- "Sponsored" / "Ad" / "Promoted"
+- "Patrocinado" / "Publicidad" / "Anuncio"
+
+## Logs y diagnóstico
+
+- Log de actividad: `activity.log`
+- En la GUI puedes abrir "Ver log en vivo" para inspección en tiempo real.
+
+Si algo falla, comparte el bloque del log desde el inicio del evento hasta el error para depuración precisa.
+
+## Estructura y mantenimiento
 
 Compilar y validar sintaxis:
 
