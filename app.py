@@ -54,6 +54,7 @@ UI_TEXTS = {
     "pick_image_folder": "Elegir carpeta imagenes",
     "download_image": "Descargar imagen URL",
     "clipboard_monitor": "Monitor portapapeles (auto)",
+    "remember_window_position": "Recordar ubicacion de la ventana",
   },
   "en": {
     "ui_language": "UI Language:",
@@ -85,6 +86,7 @@ UI_TEXTS = {
     "pick_image_folder": "Choose image folder",
     "download_image": "Download image URL",
     "clipboard_monitor": "Clipboard monitor (auto)",
+    "remember_window_position": "Remember window position",
   },
 }
 COOKIE_ERROR_MARKERS = (
@@ -189,6 +191,8 @@ class DownloaderApp:
     self.cookies_file_var = tk.StringVar(value="")
     self.cookies_folder_var = tk.StringVar(value="")
     self.start_with_windows_var = tk.BooleanVar(value=False)
+    self.auto_save_defaults_var = tk.BooleanVar(value=False)
+    self.remember_window_position_var = tk.BooleanVar(value=False)
     self.feed_image_seconds_var = tk.StringVar(value="10")
     self.feed_scroll_pause_var = tk.StringVar(value="1.5")
     self.feed_scroll_px_var = tk.StringVar(value="900")
@@ -231,10 +235,19 @@ class DownloaderApp:
     self.x_instances_hint_var = tk.StringVar(value="")
     self.log_frame_widget: ttk.LabelFrame | None = None
     self.x_instances_signature: tuple | None = None
+    self.settings_file_path = os.path.join(os.path.dirname(__file__), "downloader_settings.json")
+    self._settings_hooks_bound = False
+    self._loading_persisted_settings = False
+    self._window_geometry_save_job: str | None = None
+    self._saved_window_geometry = ""
 
     self._load_start_with_windows_state()
+    self._load_persisted_settings()
     self._configure_ui_theme()
     self._build_ui()
+    self._bind_settings_autosave_hooks()
+    self.root.protocol("WM_DELETE_WINDOW", self._on_main_close)
+    self.root.after(0, self._apply_initial_window_state)
     self._prepare_log_file()
     self._auto_load_default_cookies_file()
     out_dir = self.output_dir_var.get().strip() or os.path.join(os.path.dirname(os.path.dirname(__file__)), "videos")
@@ -257,7 +270,7 @@ class DownloaderApp:
     return UI_TEXTS.get(lang, UI_TEXTS["es"]).get(key, default)
 
   def _configure_ui_theme(self) -> None:
-    self.root.configure(bg="#eef2f7")
+    self.root.configure(bg="#f3f6fb")
     style = ttk.Style(self.root)
     try:
       style.theme_use("clam")
@@ -267,32 +280,76 @@ class DownloaderApp:
     base_font = ("Segoe UI", 10)
     heading_font = ("Segoe UI Semibold", 10)
 
-    style.configure(".", font=base_font, background="#eef2f7", foreground="#1f2937")
-    style.configure("TFrame", background="#eef2f7")
-    style.configure("Card.TLabelframe", background="#f8fafc", borderwidth=1, relief="solid")
-    style.configure("Card.TLabelframe.Label", background="#eef2f7", foreground="#0f172a", font=heading_font)
-    style.configure("TLabel", background="#eef2f7", foreground="#1f2937")
-    style.configure("TCheckbutton", background="#eef2f7", foreground="#1f2937")
-    style.configure("TEntry", fieldbackground="#ffffff", foreground="#111827", padding=5)
-    style.configure("TCombobox", fieldbackground="#ffffff", foreground="#111827", padding=4)
-    style.configure("TButton", padding=(10, 6), font=("Segoe UI Semibold", 9))
+    style.configure(".", font=base_font, background="#f3f6fb", foreground="#172033")
+    style.configure("TFrame", background="#f3f6fb")
+    style.configure("TLabel", background="#f3f6fb", foreground="#172033")
+    style.configure("TCheckbutton", background="#f3f6fb", foreground="#172033")
+    style.map("TCheckbutton", background=[("active", "#f3f6fb")])
 
-    style.configure("Accent.TButton", background="#2563eb", foreground="#ffffff", bordercolor="#1d4ed8")
+    style.configure(
+      "Card.TLabelframe",
+      background="#ffffff",
+      borderwidth=1,
+      relief="solid",
+      bordercolor="#d6deea",
+      lightcolor="#d6deea",
+      darkcolor="#d6deea",
+    )
+    style.configure("Card.TLabelframe.Label", background="#f3f6fb", foreground="#0f172a", font=heading_font)
+
+    style.configure(
+      "TEntry",
+      fieldbackground="#ffffff",
+      foreground="#111827",
+      bordercolor="#c8d3e5",
+      lightcolor="#c8d3e5",
+      darkcolor="#c8d3e5",
+      padding=6,
+    )
+    style.configure(
+      "TCombobox",
+      fieldbackground="#ffffff",
+      foreground="#111827",
+      bordercolor="#c8d3e5",
+      lightcolor="#c8d3e5",
+      darkcolor="#c8d3e5",
+      padding=5,
+    )
+
+    style.configure("TButton", padding=(12, 7), font=("Segoe UI Semibold", 9))
+    style.configure("Accent.TButton", background="#0f62fe", foreground="#ffffff", bordercolor="#0b4fd1")
     style.map(
       "Accent.TButton",
-      background=[("pressed", "#1e3a8a"), ("active", "#1d4ed8")],
+      background=[("pressed", "#0a3ea7"), ("active", "#0b4fd1")],
       foreground=[("disabled", "#cbd5e1"), ("!disabled", "#ffffff")],
     )
 
-    style.configure("Danger.TButton", background="#ef4444", foreground="#ffffff", bordercolor="#dc2626")
+    style.configure("Danger.TButton", background="#dc2626", foreground="#ffffff", bordercolor="#b91c1c")
     style.map(
       "Danger.TButton",
       background=[("pressed", "#b91c1c"), ("active", "#dc2626")],
       foreground=[("disabled", "#cbd5e1"), ("!disabled", "#ffffff")],
     )
 
-    style.configure("Subtle.TButton", background="#e2e8f0", foreground="#0f172a")
-    style.map("Subtle.TButton", background=[("active", "#cbd5e1")])
+    style.configure("Subtle.TButton", background="#e7edf7", foreground="#0f172a", bordercolor="#c8d3e5")
+    style.map("Subtle.TButton", background=[("active", "#d7e2f2")])
+
+    style.configure("App.TNotebook", background="#f3f6fb", borderwidth=0, tabmargins=(0, 4, 0, 0))
+    style.configure(
+      "App.TNotebook.Tab",
+      padding=(14, 8),
+      font=("Segoe UI Semibold", 9),
+      background="#dfe7f4",
+      foreground="#263246",
+    )
+    style.map(
+      "App.TNotebook.Tab",
+      background=[("selected", "#ffffff"), ("active", "#eaf0f9")],
+      foreground=[("selected", "#0f172a"), ("active", "#1d2a3f")],
+    )
+
+    style.configure("HeroTitle.TLabel", background="#f3f6fb", foreground="#0f172a", font=("Segoe UI Semibold", 16))
+    style.configure("HeroSub.TLabel", background="#f3f6fb", foreground="#475569", font=("Segoe UI", 10))
 
   def _detect_monitors(self) -> list[dict]:
     monitors: list[dict] = []
@@ -732,6 +789,15 @@ class DownloaderApp:
       scraper.request_skip()
       self.log(f"Skip solicitado para {item.get('name')}")
 
+  def _prev_instance(self, instance_id: int) -> None:
+    item = self._get_instance_item(instance_id)
+    if not item:
+      return
+    scraper = item.get("scraper")
+    if scraper:
+      scraper.request_prev()
+      self.log(f"Prev solicitado para {item.get('name')}")
+
   def _like_instance_current_post(self, instance_id: int) -> None:
     item = self._get_instance_item(instance_id)
     if not item:
@@ -800,6 +866,16 @@ class DownloaderApp:
         scraper.request_skip()
     if items:
       self.log("Skip global aplicado a instancias X")
+
+  def _prev_all_twitter_instances(self) -> None:
+    with self.twitter_instances_lock:
+      items = list(self.twitter_instances.values())
+    for item in items:
+      scraper = item.get("scraper")
+      if scraper and scraper.is_running():
+        scraper.request_prev()
+    if items:
+      self.log("Prev global aplicado a instancias X")
 
   def _set_instance_fullscreen(self, instance_id: int, enabled: bool | None = None) -> None:
     item = self._get_instance_item(instance_id)
@@ -964,6 +1040,7 @@ class DownloaderApp:
 
     global_row = ttk.Frame(table)
     global_row.pack(fill="x", pady=(0, 8))
+    ttk.Button(global_row, text="PREV global", style="Subtle.TButton", command=self._prev_all_twitter_instances).pack(side="left", padx=(0, 8))
     ttk.Button(global_row, text="Skip global", style="Subtle.TButton", command=self._skip_all_twitter_instances).pack(side="left", padx=(0, 8))
     ttk.Button(global_row, text="F11 global", style="Subtle.TButton", command=lambda: self._set_all_instances_fullscreen(True)).pack(side="left", padx=(0, 8))
     ttk.Button(global_row, text="Salir F11 global", style="Subtle.TButton", command=lambda: self._set_all_instances_fullscreen(False)).pack(side="left", padx=(0, 8))
@@ -1005,41 +1082,70 @@ class DownloaderApp:
       ttk.Button(controls, text=screen_text, style="Subtle.TButton", command=lambda iid=instance_id: self._set_instance_fullscreen(iid)).pack(side="left", padx=2)
       ttk.Button(controls, text="Like", style="Subtle.TButton", command=lambda iid=instance_id: self._like_instance_current_post(iid)).pack(side="left", padx=2)
       ttk.Button(controls, text="Retweet", style="Subtle.TButton", command=lambda iid=instance_id: self._retweet_instance_current_post(iid)).pack(side="left", padx=2)
+      ttk.Button(controls, text="PREV", style="Subtle.TButton", command=lambda iid=instance_id: self._prev_instance(iid)).pack(side="left", padx=2)
       ttk.Button(controls, text="Skip", style="Subtle.TButton", command=lambda iid=instance_id: self._skip_instance(iid)).pack(side="left", padx=2)
       ttk.Button(controls, text="Detener", style="Danger.TButton", command=lambda iid=instance_id: self._stop_instance(iid)).pack(side="left", padx=2)
       ttk.Button(controls, text="Kill", style="Danger.TButton", command=lambda iid=instance_id: self._kill_instance(iid)).pack(side="left", padx=2)
 
-  def _startup_cmd_path(self) -> str:
+  def _startup_vbs_path(self) -> str:
     appdata = os.environ.get("APPDATA", "").strip()
     startup_dir = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
     app_name = os.path.splitext(os.path.basename(__file__))[0]
-    return os.path.join(startup_dir, f"{app_name}_autostart.cmd")
+    return os.path.join(startup_dir, f"{app_name}_autostart.vbs")
+
+  def _legacy_startup_paths(self) -> list[str]:
+    startup_path = self._startup_vbs_path()
+    startup_dir = os.path.dirname(startup_path)
+    app_name = os.path.splitext(os.path.basename(__file__))[0]
+    return [
+      os.path.join(startup_dir, f"{app_name}_autostart.cmd"),
+      os.path.join(startup_dir, f"{app_name}_autostart.bat"),
+    ]
+
+  def _preferred_startup_pythonw(self) -> str:
+    python_dir = os.path.dirname(os.path.abspath(sys.executable))
+    pythonw_path = os.path.join(python_dir, "pythonw.exe")
+    if os.path.isfile(pythonw_path):
+      return pythonw_path
+    return sys.executable
+
+  def _remove_legacy_startup_files(self) -> None:
+    for legacy_path in self._legacy_startup_paths():
+      if os.path.isfile(legacy_path):
+        os.remove(legacy_path)
 
   def _load_start_with_windows_state(self) -> None:
     try:
-      self.start_with_windows_var.set(os.path.isfile(self._startup_cmd_path()))
+      startup_path = self._startup_vbs_path()
+      legacy_paths = self._legacy_startup_paths()
+      legacy_exists = any(os.path.isfile(path) for path in legacy_paths)
+      self.start_with_windows_var.set(os.path.isfile(startup_path) or legacy_exists)
+      if legacy_exists:
+        self._set_start_with_windows_enabled(True)
+        self.start_with_windows_var.set(True)
     except Exception:
       self.start_with_windows_var.set(False)
 
   def _set_start_with_windows_enabled(self, enabled: bool) -> None:
-    startup_cmd = self._startup_cmd_path()
-    startup_dir = os.path.dirname(startup_cmd)
+    startup_vbs = self._startup_vbs_path()
+    startup_dir = os.path.dirname(startup_vbs)
 
     if enabled:
       os.makedirs(startup_dir, exist_ok=True)
+      self._remove_legacy_startup_files()
+      python_path = self._preferred_startup_pythonw()
       script_path = os.path.abspath(__file__)
-      script_dir = os.path.dirname(script_path)
       content = (
-        "@echo off\n"
-        f"cd /d \"{script_dir}\"\n"
-        f"\"{sys.executable}\" \"{script_path}\"\n"
+        'Set shell = CreateObject("WScript.Shell")\n'
+        f'shell.Run Chr(34) & "{python_path}" & Chr(34) & " " & Chr(34) & "{script_path}" & Chr(34), 0, False\n'
       )
-      with open(startup_cmd, "w", encoding="utf-8", errors="replace") as f:
+      with open(startup_vbs, "w", encoding="utf-8", errors="replace") as f:
         f.write(content)
       return
 
-    if os.path.isfile(startup_cmd):
-      os.remove(startup_cmd)
+    if os.path.isfile(startup_vbs):
+      os.remove(startup_vbs)
+    self._remove_legacy_startup_files()
 
   def _on_start_with_windows_toggle(self) -> None:
     enabled = bool(self.start_with_windows_var.get())
@@ -1075,8 +1181,245 @@ class DownloaderApp:
       if self.log_history:
         self.log_widget.insert("end", "\n".join(self.log_history[-500:]) + "\n")
         self.log_widget.see("end")
+      self._autosave_if_enabled()
     except Exception as exc:
       self.log(f"Aviso idioma UI: {exc}")
+
+  def _load_persisted_settings(self) -> None:
+    path = self.settings_file_path
+    if not os.path.isfile(path):
+      return
+
+    try:
+      with open(path, "r", encoding="utf-8", errors="replace") as f:
+        data = json.load(f)
+    except Exception as exc:
+      self.log(f"Aviso ajustes: no se pudo leer {path}: {exc}")
+      return
+
+    if not isinstance(data, dict):
+      return
+
+    self._loading_persisted_settings = True
+    try:
+      auto_save = bool(data.get("auto_save_defaults", data.get("auto_save", False)))
+      self.auto_save_defaults_var.set(auto_save)
+      self.output_dir_var.set(str(data.get("output_dir", self.output_dir_var.get()) or "").strip())
+      self.image_output_dir_var.set(str(data.get("image_output_dir", self.image_output_dir_var.get()) or "").strip())
+      self.cookies_file_var.set(str(data.get("cookies_file", self.cookies_file_var.get()) or "").strip())
+
+      cookies_dir = str(data.get("cookies_folder", "") or "").strip()
+      if not cookies_dir:
+        cookies_dir = str(data.get("cookies_dir", self.cookies_folder_var.get()) or "").strip()
+      self.cookies_folder_var.set(cookies_dir)
+
+      self.use_cookies_var.set(bool(data.get("use_cookies", self.use_cookies_var.get())))
+      self.cookies_browser_var.set(str(data.get("cookies_browser", self.cookies_browser_var.get()) or "chrome"))
+      self.selected_language_var.set(str(data.get("selected_language", self.selected_language_var.get()) or "auto"))
+      self.selected_quality_var.set(str(data.get("selected_quality", self.selected_quality_var.get()) or "best"))
+      self.selected_audio_quality_var.set(str(data.get("selected_audio_quality", self.selected_audio_quality_var.get()) or "best audio"))
+      self.include_subtitles_var.set(bool(data.get("include_subtitles", self.include_subtitles_var.get())))
+      self.embed_subtitles_var.set(bool(data.get("embed_subtitles", self.embed_subtitles_var.get())))
+      self.subtitle_lang_var.set(str(data.get("subtitle_lang", self.subtitle_lang_var.get()) or "auto"))
+      self.audio_only_var.set(bool(data.get("audio_only", self.audio_only_var.get())))
+      self.compression_var.set(str(data.get("compression", self.compression_var.get()) or "sin_compresion"))
+      self.feed_image_seconds_var.set(str(data.get("feed_image_seconds", self.feed_image_seconds_var.get()) or "10"))
+      self.feed_scroll_pause_var.set(str(data.get("feed_scroll_pause", self.feed_scroll_pause_var.get()) or "1.5"))
+      self.feed_scroll_px_var.set(str(data.get("feed_scroll_px", self.feed_scroll_px_var.get()) or "900"))
+      self.feed_wait_video_end_var.set(bool(data.get("feed_wait_video_end", self.feed_wait_video_end_var.get())))
+      self.feed_max_video_wait_var.set(str(data.get("feed_max_video_wait", self.feed_max_video_wait_var.get()) or "300"))
+      self.feed_tiktok_likes_only_var.set(bool(data.get("feed_tiktok_likes_only", self.feed_tiktok_likes_only_var.get())))
+      self.feed_twitter_creator_folders_var.set(bool(data.get("feed_twitter_creator_folders", self.feed_twitter_creator_folders_var.get())))
+      self.x_actions_user_var.set(str(data.get("x_actions_user", data.get("x_user", self.x_actions_user_var.get())) or "").strip())
+      self.x_actions_poll_seconds_var.set(str(data.get("x_actions_poll_seconds", self.x_actions_poll_seconds_var.get()) or "45"))
+      self.x_actions_bookmarks_var.set(bool(data.get("x_actions_bookmarks", self.x_actions_bookmarks_var.get())))
+      self.x_actions_likes_var.set(bool(data.get("x_actions_likes", self.x_actions_likes_var.get())))
+      self.x_actions_retweets_var.set(bool(data.get("x_actions_retweets", self.x_actions_retweets_var.get())))
+      self.x_actions_profile_var.set(bool(data.get("x_actions_profile", self.x_actions_profile_var.get())))
+      self.ui_language_var.set(str(data.get("ui_language", self.ui_language_var.get()) or "es"))
+      self.clipboard_monitor_var.set(bool(data.get("clipboard_monitor", self.clipboard_monitor_var.get())))
+      self.remember_window_position_var.set(bool(data.get("remember_window_position", self.remember_window_position_var.get())))
+      self._saved_window_geometry = str(data.get("window_geometry", "") or "").strip()
+    finally:
+      self._loading_persisted_settings = False
+
+  def _settings_payload(self) -> dict:
+    return {
+      "auto_save": bool(self.auto_save_defaults_var.get()),
+      "auto_save_defaults": bool(self.auto_save_defaults_var.get()),
+      "output_dir": (self.output_dir_var.get() or "").strip(),
+      "image_output_dir": (self.image_output_dir_var.get() or "").strip(),
+      "cookies_file": (self.cookies_file_var.get() or "").strip(),
+      "cookies_dir": (self.cookies_folder_var.get() or "").strip(),
+      "cookies_folder": (self.cookies_folder_var.get() or "").strip(),
+      "use_cookies": bool(self.use_cookies_var.get()),
+      "cookies_browser": (self.cookies_browser_var.get() or "").strip(),
+      "selected_language": (self.selected_language_var.get() or "").strip(),
+      "selected_quality": (self.selected_quality_var.get() or "").strip(),
+      "selected_audio_quality": (self.selected_audio_quality_var.get() or "").strip(),
+      "include_subtitles": bool(self.include_subtitles_var.get()),
+      "embed_subtitles": bool(self.embed_subtitles_var.get()),
+      "subtitle_lang": (self.subtitle_lang_var.get() or "").strip(),
+      "audio_only": bool(self.audio_only_var.get()),
+      "compression": (self.compression_var.get() or "").strip(),
+      "feed_image_seconds": (self.feed_image_seconds_var.get() or "").strip(),
+      "feed_scroll_pause": (self.feed_scroll_pause_var.get() or "").strip(),
+      "feed_scroll_px": (self.feed_scroll_px_var.get() or "").strip(),
+      "feed_wait_video_end": bool(self.feed_wait_video_end_var.get()),
+      "feed_max_video_wait": (self.feed_max_video_wait_var.get() or "").strip(),
+      "feed_tiktok_likes_only": bool(self.feed_tiktok_likes_only_var.get()),
+      "feed_twitter_creator_folders": bool(self.feed_twitter_creator_folders_var.get()),
+      "x_user": (self.x_actions_user_var.get() or "").strip(),
+      "x_actions_user": (self.x_actions_user_var.get() or "").strip(),
+      "x_actions_poll_seconds": (self.x_actions_poll_seconds_var.get() or "").strip(),
+      "x_actions_bookmarks": bool(self.x_actions_bookmarks_var.get()),
+      "x_actions_likes": bool(self.x_actions_likes_var.get()),
+      "x_actions_retweets": bool(self.x_actions_retweets_var.get()),
+      "x_actions_profile": bool(self.x_actions_profile_var.get()),
+      "ui_language": (self.ui_language_var.get() or "").strip(),
+      "clipboard_monitor": bool(self.clipboard_monitor_var.get()),
+      "remember_window_position": bool(self.remember_window_position_var.get()),
+      "window_geometry": self._current_window_geometry() if self.remember_window_position_var.get() else "",
+      "window_state": self._current_window_state(),
+    }
+
+  def _save_persisted_settings(self, silent: bool = True) -> None:
+    payload = self._settings_payload()
+    path = self.settings_file_path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", errors="replace") as f:
+      json.dump(payload, f, indent=2, ensure_ascii=True)
+    if not silent:
+      self.log(f"Configuracion guardada en {path}")
+
+  def _autosave_if_enabled(self) -> None:
+    if self._loading_persisted_settings:
+      return
+    if not self.auto_save_defaults_var.get():
+      return
+    try:
+      self._save_persisted_settings(silent=True)
+    except Exception as exc:
+      self.log(f"Aviso autosave: {exc}")
+
+  def _bind_settings_autosave_hooks(self) -> None:
+    if self._settings_hooks_bound:
+      return
+
+    watched_vars = [
+      self.auto_save_defaults_var,
+      self.output_dir_var,
+      self.image_output_dir_var,
+      self.cookies_file_var,
+      self.cookies_folder_var,
+      self.use_cookies_var,
+      self.cookies_browser_var,
+      self.selected_language_var,
+      self.selected_quality_var,
+      self.selected_audio_quality_var,
+      self.include_subtitles_var,
+      self.embed_subtitles_var,
+      self.subtitle_lang_var,
+      self.audio_only_var,
+      self.compression_var,
+      self.feed_image_seconds_var,
+      self.feed_scroll_pause_var,
+      self.feed_scroll_px_var,
+      self.feed_wait_video_end_var,
+      self.feed_max_video_wait_var,
+      self.feed_tiktok_likes_only_var,
+      self.feed_twitter_creator_folders_var,
+      self.x_actions_user_var,
+      self.x_actions_poll_seconds_var,
+      self.x_actions_bookmarks_var,
+      self.x_actions_likes_var,
+      self.x_actions_retweets_var,
+      self.x_actions_profile_var,
+      self.ui_language_var,
+      self.clipboard_monitor_var,
+      self.remember_window_position_var,
+    ]
+
+    for var in watched_vars:
+      var.trace_add("write", lambda *_: self._autosave_if_enabled())
+
+    self._settings_hooks_bound = True
+
+  def _on_auto_save_defaults_toggle(self) -> None:
+    enabled = bool(self.auto_save_defaults_var.get())
+    if enabled:
+      try:
+        self._save_persisted_settings(silent=False)
+      except Exception as exc:
+        self.auto_save_defaults_var.set(False)
+        messagebox.showerror(APP_TITLE, f"No se pudo activar guardado automatico: {exc}")
+        return
+      self.log("Guardado automatico de predeterminados: activado")
+      return
+
+    self.log("Guardado automatico de predeterminados: desactivado")
+
+  def _current_window_geometry(self) -> str:
+    try:
+      geometry = str(self.root.geometry() or "").strip()
+    except Exception:
+      geometry = ""
+    return geometry
+
+  def _current_window_state(self) -> str:
+    try:
+      state = str(self.root.state() or "").strip().lower()
+    except Exception:
+      state = ""
+    return state
+
+  def _maximize_main_window(self) -> None:
+    try:
+      self.root.state("zoomed")
+      return
+    except Exception:
+      pass
+    try:
+      self.root.attributes("-zoomed", True)
+    except Exception:
+      pass
+
+  def _apply_initial_window_state(self) -> None:
+    if self.remember_window_position_var.get() and self._saved_window_geometry:
+      try:
+        self.root.geometry(self._saved_window_geometry)
+      except Exception:
+        pass
+    self.root.after(100, self._maximize_main_window)
+
+  def _schedule_window_geometry_save(self) -> None:
+    if self._loading_persisted_settings:
+      return
+    if not self.remember_window_position_var.get():
+      return
+    try:
+      if self._window_geometry_save_job:
+        self.root.after_cancel(self._window_geometry_save_job)
+    except Exception:
+      pass
+    self._window_geometry_save_job = self.root.after(600, self._save_window_geometry)
+
+  def _save_window_geometry(self) -> None:
+    self._window_geometry_save_job = None
+    if self._loading_persisted_settings or not self.remember_window_position_var.get():
+      return
+    try:
+      self._save_persisted_settings(silent=True)
+    except Exception:
+      pass
+
+  def _on_main_close(self) -> None:
+    try:
+      if self.remember_window_position_var.get():
+        self._save_persisted_settings(silent=True)
+    except Exception:
+      pass
+    self.root.destroy()
 
   def _install_python_package(self, package_name: str) -> bool:
     proc = subprocess.run(
@@ -1943,7 +2286,7 @@ class DownloaderApp:
           (maxCount) => {
             const normalizeStatus = (href) => {
               if (!href) return null;
-              const m = String(href).match(/https?:\/\/(?:www\.)?(?:x|twitter)\.com\/(?:([^\/?#]+)\/status|i(?:\/web)?\/status)\/(\d+)/i);
+              const m = String(href).match(/https?:\\/\\/(?:www\\.)?(?:x|twitter)\\.com\\/(?:([^\\/?#]+)\\/status|i(?:\\/web)?\\/status)\\/(\\d+)/i);
               if (!m) return null;
               if ((m[1] || '').toLowerCase() === 'i') {
                 return `https://x.com/i/web/status/${m[2]}`;
@@ -2350,7 +2693,7 @@ class DownloaderApp:
     shell = ttk.Frame(self.root)
     shell.pack(fill="both", expand=True)
 
-    canvas = tk.Canvas(shell, highlightthickness=0, bg="#eef2f7")
+    canvas = tk.Canvas(shell, highlightthickness=0, bg="#f3f6fb")
     v_scroll = ttk.Scrollbar(shell, orient="vertical", command=canvas.yview)
     h_scroll = ttk.Scrollbar(shell, orient="horizontal", command=canvas.xview)
     canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
@@ -2359,11 +2702,12 @@ class DownloaderApp:
     v_scroll.pack(side="right", fill="y")
     canvas.pack(side="left", fill="both", expand=True)
 
-    main = ttk.Frame(canvas, padding=16)
+    main = ttk.Frame(canvas, padding=18)
     main_window = canvas.create_window((0, 0), window=main, anchor="nw")
 
     def _on_main_configure(_event=None) -> None:
       canvas.configure(scrollregion=canvas.bbox("all"))
+      self._schedule_window_geometry_save()
 
     def _on_canvas_configure(event) -> None:
       target_width = max(360, event.width)
@@ -2380,6 +2724,7 @@ class DownloaderApp:
         canvas.yview_scroll(int(-1 * (delta / 120)), "units")
 
     main.bind("<Configure>", _on_main_configure)
+    self.root.bind("<Configure>", _on_main_configure, add="+")
     canvas.bind("<Configure>", _on_canvas_configure)
     self.root.bind_all("<MouseWheel>", _on_mousewheel)
     self.root.bind_all("<Button-4>", _on_mousewheel)
@@ -2408,7 +2753,26 @@ class DownloaderApp:
     lang_combo.bind("<<ComboboxSelected>>", _set_lang)
     lang_combo.pack(side="left")
 
-    top = ttk.LabelFrame(main, text=self._tr("source", "Fuente"), style="Card.TLabelframe", padding=10)
+    hero = ttk.Frame(main)
+    hero.pack(fill="x", pady=(0, 10))
+    ttk.Label(hero, text="Downloader Control Center", style="HeroTitle.TLabel").pack(anchor="w")
+    ttk.Label(
+      hero,
+      text="Gestiona descargas, automatizacion de feeds y monitoreo X desde una sola interfaz.",
+      style="HeroSub.TLabel",
+    ).pack(anchor="w", pady=(2, 0))
+
+    notebook = ttk.Notebook(main, style="App.TNotebook")
+    notebook.pack(fill="both", expand=True)
+
+    tab_downloads = ttk.Frame(notebook, padding=8)
+    tab_automation = ttk.Frame(notebook, padding=8)
+    tab_activity = ttk.Frame(notebook, padding=8)
+    notebook.add(tab_downloads, text="Descargas")
+    notebook.add(tab_automation, text="Automatizacion")
+    notebook.add(tab_activity, text="Actividad")
+
+    top = ttk.LabelFrame(tab_downloads, text=self._tr("source", "Fuente"), style="Card.TLabelframe", padding=10)
     top.pack(fill="x", pady=(0, 10))
 
     ttk.Label(top, text="URL:").grid(row=0, column=0, sticky="w", padx=8, pady=8)
@@ -2441,9 +2805,22 @@ class DownloaderApp:
       row=3, column=3, padx=8, pady=8
     )
 
+    ttk.Checkbutton(
+      top,
+      text="Guardar predeterminados automaticamente",
+      variable=self.auto_save_defaults_var,
+      command=self._on_auto_save_defaults_toggle,
+    ).grid(row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(2, 8))
+    ttk.Checkbutton(
+      top,
+      text=self._tr("remember_window_position", "Recordar ubicacion de la ventana"),
+      variable=self.remember_window_position_var,
+      command=self._schedule_window_geometry_save,
+    ).grid(row=5, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 8))
+
     top.columnconfigure(1, weight=1)
 
-    social = ttk.LabelFrame(main, text=self._tr("social", "Redes Sociales"), style="Card.TLabelframe", padding=10)
+    social = ttk.LabelFrame(tab_downloads, text=self._tr("social", "Redes Sociales"), style="Card.TLabelframe", padding=10)
     social.pack(fill="x", pady=(0, 10))
 
     ttk.Label(social, text="Instagram URL:").grid(row=0, column=0, sticky="w", padx=8, pady=6)
@@ -2476,7 +2853,7 @@ class DownloaderApp:
 
     social.columnconfigure(1, weight=1)
 
-    cfg = ttk.LabelFrame(main, text=self._tr("options", "Opciones"), style="Card.TLabelframe", padding=10)
+    cfg = ttk.LabelFrame(tab_downloads, text=self._tr("options", "Opciones"), style="Card.TLabelframe", padding=10)
     cfg.pack(fill="x", pady=(0, 10))
 
     ttk.Label(cfg, text="Tamano objetivo (MB):").grid(row=0, column=0, sticky="w", padx=8, pady=6)
@@ -2580,7 +2957,7 @@ class DownloaderApp:
     ttk.Entry(cfg, textvariable=self.cookies_folder_var, width=42).grid(row=7, column=1, columnspan=3, sticky="ew", padx=8, pady=6)
     ttk.Button(cfg, text="Elegir carpeta", command=self.pick_cookies_folder).grid(row=7, column=4, padx=8, pady=6)
 
-    actions = ttk.LabelFrame(main, text=self._tr("downloads", "Descargas"), style="Card.TLabelframe", padding=10)
+    actions = ttk.LabelFrame(tab_downloads, text=self._tr("downloads", "Descargas"), style="Card.TLabelframe", padding=10)
     actions.pack(fill="x", pady=(0, 10))
 
     ttk.Button(actions, text=self._tr("best", "BEST (audio+video)"), command=self.download_best, style="Accent.TButton").pack(
@@ -2613,7 +2990,7 @@ class DownloaderApp:
       variable=self.clipboard_monitor_var,
     ).pack(side="left", padx=14, pady=10)
 
-    feed = ttk.LabelFrame(main, text=self._tr("feed", "Feed Automático"), style="Card.TLabelframe", padding=10)
+    feed = ttk.LabelFrame(tab_automation, text=self._tr("feed", "Feed Automático"), style="Card.TLabelframe", padding=10)
     feed.pack(fill="x", pady=(0, 10))
 
     for col in range(6):
@@ -2689,12 +3066,13 @@ class DownloaderApp:
       row=8, column=2, columnspan=2, padx=8, pady=8, sticky="ew"
     )
 
-    self.x_instances_panel = ttk.LabelFrame(main, text="Instancias Feed X", style="Card.TLabelframe", padding=10)
+    self.x_instances_panel = ttk.LabelFrame(tab_automation, text="Instancias Feed X", style="Card.TLabelframe", padding=10)
+    self.x_instances_panel.pack(fill="x", pady=(0, 10))
     self.x_instances_table = ttk.Frame(self.x_instances_panel)
     self.x_instances_table.pack(fill="x")
     self.x_instances_signature = None
 
-    log_frame = ttk.LabelFrame(main, text=self._tr("log", "Log"), style="Card.TLabelframe", padding=10)
+    log_frame = ttk.LabelFrame(tab_activity, text=self._tr("log", "Log"), style="Card.TLabelframe", padding=10)
     log_frame.pack(fill="both", expand=True)
     self.log_frame_widget = log_frame
 
@@ -2702,12 +3080,12 @@ class DownloaderApp:
       log_frame,
       height=20,
       wrap="word",
-      bg="#0f172a",
-      fg="#e2e8f0",
-      insertbackground="#e2e8f0",
+      bg="#0b1220",
+      fg="#dbe7ff",
+      insertbackground="#dbe7ff",
       relief="flat",
-      padx=10,
-      pady=8,
+      padx=12,
+      pady=10,
     )
     self.log_widget.pack(side="left", fill="both", expand=True)
 
@@ -3066,12 +3444,18 @@ class DownloaderApp:
     if not candidates:
       return
 
-    self.cookies_file_var.set(candidates[0])
+    current_cookie = (self.cookies_file_var.get() or "").strip()
+    if not current_cookie:
+      self.cookies_file_var.set(candidates[0])
+      self.log(f"cookies detectadas automaticamente: principal={candidates[0]}")
+      if len(candidates) > 1:
+        self.log(f"cookies alterna detectada: {candidates[1]}")
+    elif not os.path.isfile(current_cookie):
+      self.cookies_file_var.set(candidates[0])
+      self.log(f"cookies guardadas no encontradas. Usando principal detectada: {candidates[0]}")
+
     if not self._selected_global_cookie():
-      self._set_global_cookie_choice(candidates[0])
-    self.log(f"cookies detectadas automaticamente: principal={candidates[0]}")
-    if len(candidates) > 1:
-      self.log(f"cookies alterna detectada: {candidates[1]}")
+      self._set_global_cookie_choice(self.cookies_file_var.get() or candidates[0])
 
   def _existing_cookie_files(self) -> list[str]:
     base_dir = os.path.dirname(os.path.dirname(__file__))

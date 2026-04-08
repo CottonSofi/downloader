@@ -199,37 +199,65 @@ class DownloaderApp:
     lang = (self.ui_language_var.get() or "es").strip().lower()
     return UI_TEXTS.get(lang, UI_TEXTS["es"]).get(key, default)
 
-  def _startup_cmd_path(self) -> str:
+  def _startup_vbs_path(self) -> str:
     appdata = os.environ.get("APPDATA", "").strip()
     startup_dir = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
     app_name = os.path.splitext(os.path.basename(__file__))[0]
-    return os.path.join(startup_dir, f"{app_name}_autostart.cmd")
+    return os.path.join(startup_dir, f"{app_name}_autostart.vbs")
+
+  def _legacy_startup_paths(self) -> list[str]:
+    startup_path = self._startup_vbs_path()
+    startup_dir = os.path.dirname(startup_path)
+    app_name = os.path.splitext(os.path.basename(__file__))[0]
+    return [
+      os.path.join(startup_dir, f"{app_name}_autostart.cmd"),
+      os.path.join(startup_dir, f"{app_name}_autostart.bat"),
+    ]
+
+  def _preferred_startup_pythonw(self) -> str:
+    python_dir = os.path.dirname(os.path.abspath(sys.executable))
+    pythonw_path = os.path.join(python_dir, "pythonw.exe")
+    if os.path.isfile(pythonw_path):
+      return pythonw_path
+    return sys.executable
+
+  def _remove_legacy_startup_files(self) -> None:
+    for legacy_path in self._legacy_startup_paths():
+      if os.path.isfile(legacy_path):
+        os.remove(legacy_path)
 
   def _load_start_with_windows_state(self) -> None:
     try:
-      self.start_with_windows_var.set(os.path.isfile(self._startup_cmd_path()))
+      startup_path = self._startup_vbs_path()
+      legacy_paths = self._legacy_startup_paths()
+      legacy_exists = any(os.path.isfile(path) for path in legacy_paths)
+      self.start_with_windows_var.set(os.path.isfile(startup_path) or legacy_exists)
+      if legacy_exists:
+        self._set_start_with_windows_enabled(True)
+        self.start_with_windows_var.set(True)
     except Exception:
       self.start_with_windows_var.set(False)
 
   def _set_start_with_windows_enabled(self, enabled: bool) -> None:
-    startup_cmd = self._startup_cmd_path()
-    startup_dir = os.path.dirname(startup_cmd)
+    startup_vbs = self._startup_vbs_path()
+    startup_dir = os.path.dirname(startup_vbs)
 
     if enabled:
       os.makedirs(startup_dir, exist_ok=True)
+      self._remove_legacy_startup_files()
+      python_path = self._preferred_startup_pythonw()
       script_path = os.path.abspath(__file__)
-      script_dir = os.path.dirname(script_path)
       content = (
-        "@echo off\n"
-        f"cd /d \"{script_dir}\"\n"
-        f"\"{sys.executable}\" \"{script_path}\"\n"
+        'Set shell = CreateObject("WScript.Shell")\n'
+        f'shell.Run Chr(34) & "{python_path}" & Chr(34) & " " & Chr(34) & "{script_path}" & Chr(34), 0, False\n'
       )
-      with open(startup_cmd, "w", encoding="utf-8", errors="replace") as f:
+      with open(startup_vbs, "w", encoding="utf-8", errors="replace") as f:
         f.write(content)
       return
 
-    if os.path.isfile(startup_cmd):
-      os.remove(startup_cmd)
+    if os.path.isfile(startup_vbs):
+      os.remove(startup_vbs)
+    self._remove_legacy_startup_files()
 
   def _on_start_with_windows_toggle(self) -> None:
     enabled = bool(self.start_with_windows_var.get())

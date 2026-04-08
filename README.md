@@ -26,22 +26,42 @@ Motor de scraping/automatizacion del feed con Playwright para:
 ### `app2.py` y `scrapper2.py`
 Copias de seguridad por si necesitas volver a una version funcional rapidamente.
 
-## 2) Requisitos minimos
+## 2) Guia de instalacion
+
+### Requisitos minimos
 
 - Windows 10/11
 - Python 3.10+ (recomendado)
-- Internet en la primera ejecucion (para instalar dependencias)
+- Internet en la primera instalacion de dependencias
+
+### Instalacion recomendada
+
+Desde la raiz del proyecto:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+Si ya tienes una `.venv` creada, basta con activarla y reinstalar dependencias si cambias de equipo.
+
+### Arranque en Windows
+
+El proyecto incluye lanzadores ocultos en `launchers/` para evitar abrir ventanas de `cmd`.
+Usa el acceso directo o el script correspondiente, por ejemplo:
+
+- `launchers\feed.vbs` para `downloader/app.py`
+- `launchers\downloader.vbs` para `downloader/downloader.py`
+- `launchers\aller.vbs` para `downloader/aller.py`
+
+Estos lanzadores usan `pythonw.exe` cuando existe para no mostrar consola.
 
 ## 3) Ejecucion recomendada (1 click)
 
-Desde la raiz del proyecto, usa:
-- `launchers\\iniciar-downloader.bat`
-
-Este script:
-1. Detecta Python disponible
-2. Instala dependencias (desde `requirements.txt` o fallback)
-3. Instala Chromium de Playwright si hace falta
-4. Ejecuta `downloader/app.py`
+Desde la raiz del proyecto, abre el lanzador correspondiente en `launchers/`.
+La GUI principal es `downloader/app.py`.
 
 ## 4) Ejecucion manual
 
@@ -72,7 +92,7 @@ El proyecto usa:
 
 Estan declaradas en `requirements.txt`.
 
-Nota: `app.py` y `feed_scraper.py` tambien intentan autoinstalar dependencias runtime si falta algo.
+Nota: no se recomienda instalar dependencias automaticamente en cada arranque. Si falta algo, la app mostrara un aviso claro para que lo instales en la misma `.venv`.
 
 ## 6) Cookies
 
