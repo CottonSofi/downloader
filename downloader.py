@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from datetime import datetime
 from urllib.request import urlopen
@@ -926,6 +927,7 @@ class DownloaderApp:
     self.log("Comando: " + " ".join(cmd))
     process = subprocess.Popen(
       cmd,
+      stdin=subprocess.DEVNULL,
       stdout=subprocess.PIPE,
       stderr=subprocess.STDOUT,
       text=True,
@@ -933,16 +935,60 @@ class DownloaderApp:
       errors="replace",
     )
 
+    started_at = time.monotonic()
+    last_output_at = started_at
+    phase_label = "ejecucion"
+    phase_started_at = started_at
+    stop_heartbeat = threading.Event()
+
+    def heartbeat() -> None:
+      last_report = 0.0
+      while not stop_heartbeat.wait(2.0):
+        if process.poll() is not None:
+          return
+        now = time.monotonic()
+        if now - last_output_at < 6.0:
+          continue
+        if now - last_report < 8.0:
+          continue
+        elapsed_phase = int(now - phase_started_at)
+        elapsed_total = int(now - started_at)
+        self.log(
+          f"Progreso: procesando ({phase_label})... {elapsed_phase}s en esta fase, {elapsed_total}s total"
+        )
+        last_report = now
+
+    heartbeat_thread = threading.Thread(target=heartbeat, daemon=True)
+    heartbeat_thread.start()
+
     assert process.stdout is not None
     recent_lines: list[str] = []
-    for line in process.stdout:
-      cleaned = line.rstrip()
-      recent_lines.append(cleaned)
-      if len(recent_lines) > 30:
-        recent_lines.pop(0)
-      self.log(cleaned)
+    try:
+      for line in process.stdout:
+        cleaned = line.rstrip()
+        last_output_at = time.monotonic()
+        lowered = cleaned.lower()
+        if "[merger]" in lowered and phase_label != "merge":
+          phase_label = "merge"
+          phase_started_at = last_output_at
+          self.log("Fase detectada: merge de audio+video")
+        elif "[videoconvertor]" in lowered and phase_label != "recodificacion":
+          phase_label = "recodificacion"
+          phase_started_at = last_output_at
+          self.log("Fase detectada: recodificacion")
+        elif "[download]" in lowered and phase_label != "descarga":
+          phase_label = "descarga"
+          phase_started_at = last_output_at
 
-    code = process.wait()
+        recent_lines.append(cleaned)
+        if len(recent_lines) > 30:
+          recent_lines.pop(0)
+        self.log(cleaned)
+      code = process.wait()
+    finally:
+      stop_heartbeat.set()
+      heartbeat_thread.join(timeout=0.2)
+
     if code != 0:
       detail = "\n".join(recent_lines[-8:]).strip()
       raise RuntimeError(f"Fallo comando con codigo {code}. {detail}")
@@ -963,6 +1009,7 @@ class DownloaderApp:
     args = [
       "--ignore-config",
       "--no-playlist",
+      "--force-overwrites",
       "--socket-timeout",
       "20",
       "--retries",
@@ -1441,7 +1488,6 @@ class DownloaderApp:
     out = self._build_output_template(url)
 
     def task() -> None:
-      compression_args = self._postprocessor_args_for_url(url, self._compression_postprocessor_args())
       specific_args = [
         "-f",
         self._language_format_selector(),
@@ -1450,9 +1496,16 @@ class DownloaderApp:
         "-o",
         out,
       ]
+      compression_args = self._compression_postprocessor_args()
+      base_reencode_args = compression_args or (
+        "ffmpeg:-c:v libx264 -preset veryfast -crf 20 -threads 0 "
+        "-vf setsar=1 -c:a aac -b:a 160k -movflags +faststart"
+      )
+      post_args = self._postprocessor_args_for_url(url, base_reencode_args) or base_reencode_args
+      specific_args += ["--recode-video", "mp4", "--postprocessor-args", post_args]
       specific_args += self._subtitle_download_args()
+      self.log("Postprocesado BEST: recodificacion optimizada para compatibilidad y ratio estable.")
       if compression_args:
-        specific_args += ["--recode-video", "mp4", "--postprocessor-args", compression_args]
         self.log(f"Compresion aplicada en {source_label.upper()} BEST: {self.compression_var.get()}")
 
       if self.include_subtitles_var.get():
@@ -1787,7 +1840,7 @@ class DownloaderApp:
     elif mode == "alta":
       cq = 28
 
-    return f"ffmpeg:-c:v h264_nvenc -cq {cq} -preset p5 -c:a aac -b:a 128k -movflags +faststart"
+    return f"ffmpeg:-c:v h264_nvenc -cq {cq} -preset p5 -threads 0 -vf setsar=1 -c:a aac -b:a 128k -movflags +faststart"
 
   def _is_youtube_shorts_url(self, url: str) -> bool:
     lower = (url or "").lower()
@@ -1801,6 +1854,8 @@ class DownloaderApp:
     if not post_args:
       return post_args
     if post_args.startswith("ffmpeg:"):
+      if " -vf " in post_args:
+        return f"{post_args},{vf_expr}"
       return f"{post_args} -vf {vf_expr}"
     return post_args
 
@@ -1812,7 +1867,7 @@ class DownloaderApp:
         args = self._apply_vf_to_postprocessor_args(args, vf_expr)
       else:
         args = (
-          f"ffmpeg:-c:v h264_nvenc -cq 22 -preset p5 -vf {vf_expr} "
+          f"ffmpeg:-c:v h264_nvenc -cq 22 -preset p5 -threads 0 -vf {vf_expr} "
           "-c:a aac -b:a 128k -movflags +faststart"
         )
       self.log("YouTube Shorts: aplicado fix de aspect ratio (crop/scale 9:16 sin bordes).")
@@ -1974,9 +2029,9 @@ class DownloaderApp:
       )
 
       ffmpeg_args = (
-        f"ffmpeg:-c:v h264_nvenc -b:v {video_kbps}k "
+        f"ffmpeg:-c:v h264_nvenc -preset p5 -threads 0 -b:v {video_kbps}k "
         f"-maxrate {video_kbps}k -bufsize {video_kbps * 2}k "
-        f"-c:a aac -b:a {audio_kbps}k -movflags +faststart"
+        f"-vf setsar=1 -c:a aac -b:a {audio_kbps}k -movflags +faststart"
       )
       ffmpeg_args = self._postprocessor_args_for_url(url, ffmpeg_args) or ffmpeg_args
 
