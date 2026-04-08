@@ -153,6 +153,62 @@ class FeedScraper:
     self._log("Audio: mute" if muted else "Audio: unmute")
     return muted
 
+  def update_runtime_settings(
+    self,
+    poll_seconds: float | None = None,
+    scroll_pause_seconds: float | None = None,
+    scroll_px: int | None = None,
+    image_dwell_seconds: float | None = None,
+    wait_video_end: bool | None = None,
+    max_video_wait_seconds: float | None = None,
+    tiktok_likes_only: bool | None = None,
+  ) -> bool:
+    changed = False
+    with self._state_lock:
+      if poll_seconds is not None:
+        new_poll = max(0.2, float(poll_seconds))
+        if abs(new_poll - self.poll_seconds) > 0.0001:
+          self.poll_seconds = new_poll
+          changed = True
+
+      if scroll_pause_seconds is not None:
+        new_pause = max(0.2, float(scroll_pause_seconds))
+        if abs(new_pause - self.scroll_pause_seconds) > 0.0001:
+          self.scroll_pause_seconds = new_pause
+          changed = True
+
+      if scroll_px is not None:
+        new_scroll = max(100, int(scroll_px))
+        if new_scroll != self.scroll_px:
+          self.scroll_px = new_scroll
+          changed = True
+
+      if image_dwell_seconds is not None:
+        new_dwell = max(1.0, float(image_dwell_seconds))
+        if abs(new_dwell - self.image_dwell_seconds) > 0.0001:
+          self.image_dwell_seconds = new_dwell
+          changed = True
+
+      if wait_video_end is not None:
+        new_wait_end = bool(wait_video_end)
+        if new_wait_end != self.wait_video_end:
+          self.wait_video_end = new_wait_end
+          changed = True
+
+      if max_video_wait_seconds is not None:
+        new_max_wait = max(5.0, float(max_video_wait_seconds))
+        if abs(new_max_wait - self.max_video_wait_seconds) > 0.0001:
+          self.max_video_wait_seconds = new_max_wait
+          changed = True
+
+      if tiktok_likes_only is not None:
+        new_tiktok_mode = bool(tiktok_likes_only)
+        if new_tiktok_mode != self.tiktok_likes_only:
+          self.tiktok_likes_only = new_tiktok_mode
+          changed = True
+
+    return changed
+
   def request_skip(self) -> None:
     with self._state_lock:
       self._nav_queue.append("skip")
@@ -703,7 +759,7 @@ class FeedScraper:
 
     root_dir = os.path.dirname(os.path.dirname(__file__))
     manual = (self.cookies_file or "").strip()
-    
+
     dirs_to_scan = [
       os.path.join(root_dir, "downloader", "cookies"),
       os.path.join(root_dir, "cookies"),
@@ -740,7 +796,7 @@ class FeedScraper:
       first = out[0]
       tail = out[1:]
       random.shuffle(tail)
-      
+
       final_list = [first] + tail
       return final_list
 
@@ -1969,6 +2025,25 @@ class FeedScraper:
       {"targetUrl": target_url, "enter": enter},
     )
 
+  def _fallback_open_twitter_carousel_index(self, page, target_url: str, index: int, in_viewer: bool) -> bool:
+    # Some video slides open in a focused state where Next/Prev controls are unavailable.
+    # Exit fullscreen/viewer first, then open the requested slide by index.
+    try:
+      self._try_fullscreen_current_video(page, target_url, enter=False)
+    except Exception:
+      pass
+
+    if in_viewer:
+      try:
+        self._close_twitter_image_viewer(page)
+      except Exception:
+        pass
+
+    try:
+      return self._open_twitter_media_at_index(page, target_url, index)
+    except Exception:
+      return False
+
   def _process_twitter_carousel(self, page, target_url: str, media_count: int, in_viewer: bool = False) -> str | None:
     # Si no hay carrusel, espera tiempo de imagen normal.
     if media_count <= 1:
@@ -1987,7 +2062,7 @@ class FeedScraper:
     while slide_index < slides and not self._stop_event.is_set():
       if self._stop_event.is_set():
         return None
-      
+
       # Dentro del viewer modal, no entrar en fullscreen de video. Solo navegar slides.
       # Los videos dentro del modal se reproducen sin fullscreen, con controles de carrusel visibles.
       if in_viewer:
@@ -1998,7 +2073,7 @@ class FeedScraper:
           wait_result = self._wait_video_or_timeout(page, target_url)
         else:
           wait_result = self._wait_with_interrupt(self.image_dwell_seconds, page)
-      
+
       if wait_result == "stop":
         return None
       if wait_result == "skip":
@@ -2012,8 +2087,7 @@ class FeedScraper:
           # En carrusel mixto, algunos videos abren un visor sin boton Next.
           # Fallback: cerrar visor y abrir directamente el siguiente indice.
           target_index = min(slides - 1, slide_index + 1)
-          self._close_twitter_image_viewer(page)
-          moved = self._open_twitter_media_at_index(page, target_url, target_index)
+          moved = self._fallback_open_twitter_carousel_index(page, target_url, target_index, in_viewer=True)
         if not moved:
           self._log("Skip en carrusel: no pude avanzar a la siguiente imagen")
           return "skip_post"
@@ -2031,8 +2105,7 @@ class FeedScraper:
               continue
             if in_viewer:
               target_index = max(0, slide_index - 1)
-              self._close_twitter_image_viewer(page)
-              if self._open_twitter_media_at_index(page, target_url, target_index):
+              if self._fallback_open_twitter_carousel_index(page, target_url, target_index, in_viewer=True):
                 self._log(f"Prev en carrusel (fallback indice): {target_index + 1}/{slides}")
                 slide_index = target_index
                 continue
@@ -2054,8 +2127,7 @@ class FeedScraper:
             continue
           if in_viewer:
             target_index = max(0, slide_index - 1)
-            self._close_twitter_image_viewer(page)
-            if self._open_twitter_media_at_index(page, target_url, target_index):
+            if self._fallback_open_twitter_carousel_index(page, target_url, target_index, in_viewer=True):
               self._log(f"Prev en carrusel (fallback indice): {target_index + 1}/{slides}")
               slide_index = target_index
               continue
@@ -2069,8 +2141,7 @@ class FeedScraper:
       moved = self._twitter_click_next_media(page, target_url, in_viewer=in_viewer)
       if not moved and in_viewer:
         target_index = min(slides - 1, slide_index + 1)
-        self._close_twitter_image_viewer(page)
-        moved = self._open_twitter_media_at_index(page, target_url, target_index)
+        moved = self._fallback_open_twitter_carousel_index(page, target_url, target_index, in_viewer=True)
       if not moved:
         break
       slide_index = min(slides - 1, slide_index + 1)
@@ -2092,8 +2163,7 @@ class FeedScraper:
             continue
           if in_viewer:
             target_index = max(0, slide_index - 1)
-            self._close_twitter_image_viewer(page)
-            if self._open_twitter_media_at_index(page, target_url, target_index):
+            if self._fallback_open_twitter_carousel_index(page, target_url, target_index, in_viewer=True):
               self._log(f"Prev en carrusel (fallback indice): {target_index + 1}/{slides}")
               slide_index = target_index
               continue
@@ -2140,7 +2210,7 @@ class FeedScraper:
         self._log("Interrumpido durante settle (viewer abierto): skip")
         self._consume_skip_request()
         return "skip_post"
-      
+
       self._log(f"Procesando carousel con viewer abierto para {target_url}")
       carousel_result = self._process_twitter_carousel(page, target_url, media_count, in_viewer=True)
       self._log(f"Carousel terminado, resultado={carousel_result}")
@@ -2619,6 +2689,90 @@ class FeedScraper:
   def _has_primary_visible_video(self, page) -> bool:
     state = self._primary_visible_video_state(page)
     return bool(state.get("has_video", False))
+
+  def _sync_page_mute_state(self, page) -> None:
+    muted = self.is_muted()
+    try:
+      page.evaluate(
+        """
+        (muted) => {
+          const media = Array.from(document.querySelectorAll('video, audio'));
+          const vh = window.innerHeight || document.documentElement.clientHeight || 0;
+          const vw = window.innerWidth || document.documentElement.clientWidth || 0;
+
+          let primary = null;
+          let primaryArea = 0;
+          for (const node of media) {
+            try {
+              const rect = node.getBoundingClientRect ? node.getBoundingClientRect() : null;
+              const visible = rect && rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
+              if (visible) {
+                const area = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0))
+                  * Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
+                if (area > primaryArea) {
+                  primaryArea = area;
+                  primary = node;
+                }
+              }
+
+              node.muted = Boolean(muted);
+              node.defaultMuted = Boolean(muted);
+              if (muted) {
+                node.volume = 0;
+              } else if (Number(node.volume || 0) === 0) {
+                node.volume = 1;
+              }
+            } catch (_) {
+              // Ignore individual node failures and continue syncing the rest.
+            }
+          }
+
+          // Fallback for custom players that ignore plain media.muted updates.
+          try {
+            const normalize = (value) => String(value || '').toLowerCase().replace(/\s+/g, ' ').trim();
+            const isVisible = (el) => {
+              if (!el || !el.getBoundingClientRect) return false;
+              const r = el.getBoundingClientRect();
+              if (r.width < 8 || r.height < 8) return false;
+              return r.bottom > 0 && r.top < vh && r.right > 0 && r.left < vw;
+            };
+
+            const root = primary
+              ? (primary.closest('[role="dialog"], article, [data-testid="videoPlayer"], [data-testid="videoComponent"]') || document)
+              : document;
+
+            const controls = Array.from(root.querySelectorAll('button, div[role="button"]')).filter(isVisible);
+            const muteHints = ['mute', 'silenciar', 'quitar sonido'];
+            const unmuteHints = ['unmute', 'activar sonido', 'con sonido', 'sonido'];
+
+            let candidate = null;
+            for (const btn of controls) {
+              const label = normalize(btn.getAttribute('aria-label') || btn.innerText || btn.textContent || '');
+              if (!label) continue;
+              if (muted && muteHints.some((hint) => label.includes(hint))) {
+                candidate = btn;
+                break;
+              }
+              if (!muted && unmuteHints.some((hint) => label.includes(hint))) {
+                candidate = btn;
+                break;
+              }
+            }
+
+            if (candidate) {
+              candidate.click();
+            }
+          } catch (_) {
+            // Ignore fallback-control errors.
+          }
+
+          window.__feed_scraper_muted = Boolean(muted);
+        }
+        """,
+        muted,
+      )
+    except Exception:
+      pass
 
   def _apply_window_placement(self, page) -> None:
     try:

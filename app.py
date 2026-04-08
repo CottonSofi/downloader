@@ -231,10 +231,15 @@ class DownloaderApp:
     self.twitter_monitor_cookie_choice: dict[int, str] = {}
     self.twitter_global_cookie_choice = tk.StringVar(value="")
     self.x_instances_panel: ttk.LabelFrame | None = None
+    self.x_instances_canvas: tk.Canvas | None = None
+    self.x_instances_canvas_window: int | None = None
+    self.x_instances_h_scroll: ttk.Scrollbar | None = None
+    self.x_instances_v_scroll: ttk.Scrollbar | None = None
     self.x_instances_table: ttk.Frame | None = None
     self.x_instances_hint_var = tk.StringVar(value="")
     self.log_frame_widget: ttk.LabelFrame | None = None
     self.x_instances_signature: tuple | None = None
+    self._last_feed_runtime_signature: tuple | None = None
     self.settings_file_path = os.path.join(os.path.dirname(__file__), "downloader_settings.json")
     self._settings_hooks_bound = False
     self._loading_persisted_settings = False
@@ -925,10 +930,93 @@ class DownloaderApp:
   def _refresh_x_instances_ui_tick(self) -> None:
     try:
       self._refresh_monitors_if_changed()
+      self._apply_live_feed_runtime_updates()
       self._prune_dead_twitter_instances()
       self._refresh_x_instances_ui()
     finally:
       self.root.after(1500, self._refresh_x_instances_ui_tick)
+
+  def _current_feed_runtime_payload(self) -> dict | None:
+    try:
+      cfg = self._feed_runtime_config()
+    except Exception:
+      return None
+
+    return {
+      "poll_seconds": float(cfg["scroll_pause"]),
+      "scroll_pause_seconds": float(cfg["scroll_pause"]),
+      "scroll_px": int(cfg["scroll_px"]),
+      "image_dwell_seconds": float(cfg["image_seconds"]),
+      "wait_video_end": bool(self.feed_wait_video_end_var.get()),
+      "max_video_wait_seconds": float(cfg["max_video_wait"]),
+      "tiktok_likes_only": bool(self.feed_tiktok_likes_only_var.get()),
+    }
+
+  def _apply_live_feed_runtime_updates(self) -> None:
+    payload = self._current_feed_runtime_payload()
+    if not payload:
+      return
+
+    signature = (
+      payload["poll_seconds"],
+      payload["scroll_pause_seconds"],
+      payload["scroll_px"],
+      payload["image_dwell_seconds"],
+      payload["wait_video_end"],
+      payload["max_video_wait_seconds"],
+      payload["tiktok_likes_only"],
+    )
+    if signature == self._last_feed_runtime_signature:
+      return
+    self._last_feed_runtime_signature = signature
+
+    updated = 0
+
+    if self.scraper and self.scraper.is_running():
+      try:
+        if self.scraper.update_runtime_settings(**payload):
+          updated += 1
+      except Exception as exc:
+        self.log(f"Aviso actualizacion feed principal: {exc}")
+
+    with self.twitter_instances_lock:
+      items = list(self.twitter_instances.values())
+
+    for item in items:
+      scraper = item.get("scraper")
+      if not scraper or not scraper.is_running():
+        continue
+      try:
+        if scraper.update_runtime_settings(**payload):
+          updated += 1
+      except Exception as exc:
+        self.log(f"Aviso actualizacion {item.get('name')}: {exc}")
+
+    if updated:
+      self.log(
+        "Feed runtime actualizado en vivo: "
+        f"pausa={payload['scroll_pause_seconds']:.2f}s, "
+        f"scroll={payload['scroll_px']}, "
+        f"imagen={payload['image_dwell_seconds']:.2f}s, "
+        f"max_video={payload['max_video_wait_seconds']:.1f}s"
+      )
+
+  def _sync_x_instances_canvas_region(self) -> None:
+    canvas = self.x_instances_canvas
+    table = self.x_instances_table
+    window_id = self.x_instances_canvas_window
+    if canvas is None or table is None or window_id is None:
+      return
+    if not canvas.winfo_exists() or not table.winfo_exists():
+      return
+
+    table.update_idletasks()
+    table_width = table.winfo_reqwidth()
+    canvas_width = canvas.winfo_width()
+    target_width = max(table_width, canvas_width)
+
+    canvas.itemconfigure(window_id, width=target_width)
+    canvas.configure(scrollregion=canvas.bbox("all"))
 
   def _refresh_x_instances_ui(self) -> None:
     panel = self.x_instances_panel
@@ -1086,6 +1174,8 @@ class DownloaderApp:
       ttk.Button(controls, text="Skip", style="Subtle.TButton", command=lambda iid=instance_id: self._skip_instance(iid)).pack(side="left", padx=2)
       ttk.Button(controls, text="Detener", style="Danger.TButton", command=lambda iid=instance_id: self._stop_instance(iid)).pack(side="left", padx=2)
       ttk.Button(controls, text="Kill", style="Danger.TButton", command=lambda iid=instance_id: self._kill_instance(iid)).pack(side="left", padx=2)
+
+    self._sync_x_instances_canvas_region()
 
   def _startup_vbs_path(self) -> str:
     appdata = os.environ.get("APPDATA", "").strip()
@@ -2639,7 +2729,7 @@ class DownloaderApp:
       default_monitor_id = int((primary or self.monitors[0]).get("id", 1))
       self._start_twitter_feed_instance(default_monitor_id)
       return
-    
+
     self.is_scraping = True
     self.scraper = FeedScraper(
       self.download_from_feed,
@@ -2710,7 +2800,7 @@ class DownloaderApp:
       self._schedule_window_geometry_save()
 
     def _on_canvas_configure(event) -> None:
-      target_width = max(360, event.width)
+      target_width = max(360, event.width, main.winfo_reqwidth())
       canvas.itemconfigure(main_window, width=target_width)
 
     def _on_mousewheel(event) -> None:
@@ -2721,7 +2811,11 @@ class DownloaderApp:
       else:
         delta = int(getattr(event, "delta", 0) or 0)
       if delta:
-        canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+        shift_pressed = bool(int(getattr(event, "state", 0) or 0) & 0x0001)
+        if shift_pressed:
+          canvas.xview_scroll(int(-1 * (delta / 120)), "units")
+        else:
+          canvas.yview_scroll(int(-1 * (delta / 120)), "units")
 
     main.bind("<Configure>", _on_main_configure)
     self.root.bind("<Configure>", _on_main_configure, add="+")
@@ -2752,6 +2846,12 @@ class DownloaderApp:
 
     lang_combo.bind("<<ComboboxSelected>>", _set_lang)
     lang_combo.pack(side="left")
+    ttk.Button(
+      lang_row,
+      text=self._tr("restart_app", "Reiniciar app"),
+      command=self.restart_application,
+      style="Danger.TButton",
+    ).pack(side="right")
 
     hero = ttk.Frame(main)
     hero.pack(fill="x", pady=(0, 10))
@@ -3065,11 +3165,60 @@ class DownloaderApp:
     ttk.Button(feed, text="Detener Monitor X", command=self.stop_x_actions_monitor, style="Danger.TButton").grid(
       row=8, column=2, columnspan=2, padx=8, pady=8, sticky="ew"
     )
+    ttk.Button(
+      feed,
+      text=self._tr("restart_app", "Reiniciar app"),
+      command=self.restart_application,
+      style="Danger.TButton",
+    ).grid(row=8, column=4, columnspan=2, padx=8, pady=8, sticky="ew")
 
     self.x_instances_panel = ttk.LabelFrame(tab_automation, text="Instancias Feed X", style="Card.TLabelframe", padding=10)
     self.x_instances_panel.pack(fill="x", pady=(0, 10))
-    self.x_instances_table = ttk.Frame(self.x_instances_panel)
-    self.x_instances_table.pack(fill="x")
+
+    canvas_shell = ttk.Frame(self.x_instances_panel)
+    canvas_shell.pack(fill="both", expand=True)
+
+    self.x_instances_canvas = tk.Canvas(canvas_shell, highlightthickness=0, bg="#f3f6fb", height=240)
+    self.x_instances_h_scroll = ttk.Scrollbar(self.x_instances_panel, orient="horizontal", command=self.x_instances_canvas.xview)
+    self.x_instances_v_scroll = ttk.Scrollbar(canvas_shell, orient="vertical", command=self.x_instances_canvas.yview)
+    self.x_instances_canvas.configure(xscrollcommand=self.x_instances_h_scroll.set, yscrollcommand=self.x_instances_v_scroll.set)
+
+    self.x_instances_canvas.pack(side="left", fill="both", expand=True)
+    self.x_instances_v_scroll.pack(side="right", fill="y")
+    self.x_instances_h_scroll.pack(fill="x", pady=(6, 0))
+
+    self.x_instances_table = ttk.Frame(self.x_instances_canvas)
+    self.x_instances_canvas_window = self.x_instances_canvas.create_window((0, 0), window=self.x_instances_table, anchor="nw")
+
+    def _on_x_instances_table_configure(_event=None) -> None:
+      self._sync_x_instances_canvas_region()
+
+    def _on_x_instances_canvas_configure(_event=None) -> None:
+      self._sync_x_instances_canvas_region()
+
+    self.x_instances_table.bind("<Configure>", _on_x_instances_table_configure)
+    self.x_instances_canvas.bind("<Configure>", _on_x_instances_canvas_configure)
+
+    def _on_x_instances_shift_wheel(event) -> str:
+      try:
+        delta = event.delta
+      except Exception:
+        delta = 0
+      if delta:
+        self.x_instances_canvas.xview_scroll(int(-1 * (delta / 120)), "units")
+      return "break"
+
+    def _on_x_instances_wheel(event) -> str:
+      try:
+        delta = event.delta
+      except Exception:
+        delta = 0
+      if delta:
+        self.x_instances_canvas.yview_scroll(int(-1 * (delta / 120)), "units")
+      return "break"
+
+    self.x_instances_canvas.bind("<MouseWheel>", _on_x_instances_wheel)
+    self.x_instances_canvas.bind("<Shift-MouseWheel>", _on_x_instances_shift_wheel)
     self.x_instances_signature = None
 
     log_frame = ttk.LabelFrame(tab_activity, text=self._tr("log", "Log"), style="Card.TLabelframe", padding=10)
@@ -3461,7 +3610,7 @@ class DownloaderApp:
     base_dir = os.path.dirname(os.path.dirname(__file__))
     manual = (self.cookies_file_var.get() or "").strip()
     folder = (self.cookies_folder_var.get() or "").strip()
-    
+
     dirs_to_scan = [
       folder,
       os.path.join(base_dir, "downloader", "cookies", "twitter"),
