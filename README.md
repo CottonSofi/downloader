@@ -3,12 +3,15 @@
 ## Archivos principales
 
 ### `app.py` 🖥️
-Aplicacion principal con interfaz Tkinter para:
+Aplicacion principal con interfaz PyQt5 para:
 - Descargar enlaces manuales con `yt-dlp`
 - Usar fallback social con `gallery-dl`
 - Manejar cookies (`cookies.txt`, `cookies2.txt`, carpeta `cookies/`)
 - Iniciar/parar feed automático (Instagram, TikTok, Twitter/X, YouTube Shorts)
 - Configuración persistente en `downloader_settings.json`
+
+### `app_oldgui.py` 🧰
+Version legacy (Tkinter) conservada para referencia/compatibilidad.
 
 ### `feed_scraper.py` 🤖
 Motor de scraping/automatización del feed con Playwright para:

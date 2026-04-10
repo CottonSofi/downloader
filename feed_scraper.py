@@ -41,6 +41,7 @@ class FeedScraper:
     monitor_bounds: dict | None = None,
     instance_name: str = "",
     cookie_candidates: list[str] | None = None,
+    browser_color_scheme: str = "dark",
   ):
     self.on_url_detected = on_url_detected
     self.poll_seconds = max(0.2, float(poll_seconds or 1.5))
@@ -56,6 +57,7 @@ class FeedScraper:
     self.monitor_bounds = monitor_bounds if isinstance(monitor_bounds, dict) else None
     self.instance_name = (instance_name or "").strip()
     self.cookie_candidates = [str(item).strip() for item in (cookie_candidates or []) if str(item).strip()]
+    self._browser_color_scheme = self._normalize_color_scheme(browser_color_scheme)
 
     self._log_callback: Callable[[str], None] | None = None
     self._stop_event = threading.Event()
@@ -82,6 +84,31 @@ class FeedScraper:
     self._runtime_page = None
     self._last_error_summary = ""
     self._last_error_log_ts = 0.0
+    self._blocked_popup_count = 0
+    self._last_popup_block_log_ts = 0.0
+
+  def _normalize_color_scheme(self, value: str) -> str:
+    clean = str(value or "").strip().lower()
+    if clean not in {"dark", "light", "no-preference"}:
+      return "dark"
+    return clean
+
+  def set_browser_color_scheme(self, value: str) -> None:
+    with self._state_lock:
+      self._browser_color_scheme = self._normalize_color_scheme(value)
+      page = self._runtime_page
+    if page is not None:
+      try:
+        page.emulate_media(color_scheme=None if self._browser_color_scheme == "no-preference" else self._browser_color_scheme)
+      except Exception:
+        pass
+
+  def _apply_browser_color_scheme(self, page) -> None:
+    scheme = self._normalize_color_scheme(self._browser_color_scheme)
+    try:
+      page.emulate_media(color_scheme=None if scheme == "no-preference" else scheme)
+    except Exception:
+      pass
 
   def set_log_callback(self, callback: Callable[[str], None]) -> None:
     self._log_callback = callback
@@ -338,6 +365,10 @@ class FeedScraper:
       if next_action == "prev":
         return next_action
       if page is not None:
+        try:
+          self._close_runtime_extra_pages(page, quiet=True)
+        except Exception:
+          pass
         try:
           self._apply_pending_window_state(page)
         except Exception:
@@ -940,6 +971,60 @@ class FeedScraper:
 
     return page
 
+  def _log_popup_block(self, closed_count: int) -> None:
+    if closed_count <= 0:
+      return
+    self._blocked_popup_count += int(closed_count)
+    now = time.time()
+    if (now - self._last_popup_block_log_ts) < 2.5:
+      return
+    self._last_popup_block_log_ts = now
+    self._log(f"Proteccion anti-popup: cerrada(s) {self._blocked_popup_count} pestana(s) nueva(s)")
+
+  def _close_extra_context_pages(self, context, keep_page=None, quiet: bool = False) -> int:
+    if context is None:
+      return 0
+
+    closed = 0
+    for candidate in list(context.pages):
+      if keep_page is not None and candidate == keep_page:
+        continue
+      try:
+        candidate.close()
+        closed += 1
+      except Exception:
+        pass
+
+    if closed and not quiet:
+      self._log_popup_block(closed)
+    return closed
+
+  def _close_runtime_extra_pages(self, keep_page=None, quiet: bool = False) -> int:
+    return self._close_extra_context_pages(self._runtime_context, keep_page=keep_page, quiet=quiet)
+
+  def _install_popup_guards(self, context, keep_page) -> None:
+    def on_new_page(new_page) -> None:
+      if self._stop_event.is_set() or self._kill_event.is_set():
+        return
+      if keep_page is not None and new_page == keep_page:
+        return
+      try:
+        new_page.close()
+        self._log_popup_block(1)
+      except Exception:
+        pass
+
+    try:
+      context.on("page", on_new_page)
+    except Exception:
+      pass
+
+    try:
+      if keep_page is not None:
+        keep_page.on("popup", on_new_page)
+    except Exception:
+      pass
+
   def _run(self, platform: Platform) -> None:
     try:
       self._run_playwright(platform)
@@ -984,10 +1069,14 @@ class FeedScraper:
           )
           self._apply_context_cookies(context)
           page = self._prepare_page(context)
+          self._install_popup_guards(context, page)
+          self._close_extra_context_pages(context, keep_page=page, quiet=True)
           self._runtime_context = context
           self._runtime_page = page
+          self._apply_browser_color_scheme(page)
           page.goto(start_url, wait_until="domcontentloaded", timeout=60000)
           self._dismiss_translation_popups(page)
+          self._apply_browser_color_scheme(page)
           self._apply_window_placement(page)
           self._apply_pending_window_state(page, force=True)
           self._log("Navegador listo. Desplazando y detectando URL visible...")
@@ -1050,6 +1139,8 @@ class FeedScraper:
     bootstrap_wait_done = False
 
     while not self._stop_event.is_set():
+      self._close_runtime_extra_pages(page, quiet=True)
+      self._apply_browser_color_scheme(page)
       self._ensure_twitter_home(page)
       self._dismiss_translation_popups(page)
       self._drain_pending_user_actions(page)
@@ -1279,15 +1370,18 @@ class FeedScraper:
 
     if not isinstance(state, dict):
       return
-    if not bool(state.get("isXHost", False)):
-      return
-    if bool(state.get("isHome", False)):
+    is_x_host = bool(state.get("isXHost", False))
+    is_home = bool(state.get("isHome", False))
+    if is_x_host and is_home:
       return
 
     now = time.time()
     if (now - self._last_home_guard_log_ts) >= 8.0:
       current = str(state.get("href") or "").strip() or "(desconocido)"
-      self._log(f"Home guard: fuera de Home ({current}), regresando a /home")
+      if not is_x_host:
+        self._log(f"Home guard: salida de dominio X ({current}), regresando a /home")
+      else:
+        self._log(f"Home guard: fuera de Home ({current}), regresando a /home")
       self._last_home_guard_log_ts = now
 
     try:
@@ -1875,6 +1969,180 @@ class FeedScraper:
       target_url,
     )
 
+  def _viewer_video_state(self, page) -> dict:
+    return page.evaluate(
+      """
+      () => {
+        const vh = window.innerHeight || document.documentElement.clientHeight;
+        const vw = window.innerWidth || document.documentElement.clientWidth;
+
+        const isVisibleNode = (el) => {
+          if (!el) return false;
+          const rect = el.getBoundingClientRect();
+          if (!(rect.width > 10 && rect.height > 10)) return false;
+          if (!(rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw)) return false;
+          const style = window.getComputedStyle(el);
+          return style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || '1') > 0.01;
+        };
+
+        const modalRoots = Array.from(
+          document.querySelectorAll('[role="dialog"], [aria-modal="true"], [data-testid="swipe-to-dismiss-container"], [data-testid="cellInnerDiv"]')
+        ).filter((node) => isVisibleNode(node));
+
+        const pickBestVideo = (root) => {
+          const videos = Array.from(root.querySelectorAll('video'));
+          let best = null;
+          let bestArea = 0;
+          for (const video of videos) {
+            if (!isVisibleNode(video)) continue;
+            const rect = video.getBoundingClientRect();
+            const area = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0))
+              * Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
+            if (area <= bestArea) continue;
+            best = video;
+            bestArea = area;
+          }
+          return { video: best, area: bestArea };
+        };
+
+        let bestVideo = null;
+        let bestArea = 0;
+        const roots = modalRoots.length ? modalRoots : [document];
+        for (const root of roots) {
+          const picked = pickBestVideo(root);
+          if (picked.video && picked.area > bestArea) {
+            bestVideo = picked.video;
+            bestArea = picked.area;
+          }
+        }
+
+        if (!bestVideo) {
+          return { has_video: false, ended: false, paused: true, current_time: 0, duration: 0, play_time: 0, loop_count: 0 };
+        }
+
+        const trackerFor = (video) => {
+          if (video.__feedTracker) {
+            return video.__feedTracker;
+          }
+
+          const tracker = {
+            play_ms: 0,
+            started_at: null,
+            last_current_time: 0,
+            last_duration: 0,
+            loop_count: 0,
+          };
+
+          const accrue = () => {
+            if (tracker.started_at !== null) {
+              tracker.play_ms += performance.now() - tracker.started_at;
+              tracker.started_at = null;
+            }
+          };
+
+          const markPlaying = () => {
+            tracker.last_duration = Number(video.duration || 0) || tracker.last_duration || 0;
+            if (!video.paused && !video.ended && tracker.started_at === null) {
+              tracker.started_at = performance.now();
+            }
+          };
+
+          try {
+            video.addEventListener('play', markPlaying, true);
+            video.addEventListener('playing', markPlaying, true);
+            video.addEventListener('pause', accrue, true);
+            video.addEventListener('ended', accrue, true);
+            video.addEventListener('loadedmetadata', markPlaying, true);
+            video.addEventListener('timeupdate', () => {
+              const currentTime = Number(video.currentTime || 0);
+              if (tracker.started_at !== null && currentTime + 0.5 < tracker.last_current_time) {
+                tracker.loop_count += 1;
+              }
+              tracker.last_current_time = currentTime;
+              tracker.last_duration = Number(video.duration || 0) || tracker.last_duration || 0;
+              if (!video.paused && !video.ended && tracker.started_at === null) {
+                tracker.started_at = performance.now();
+              }
+            }, true);
+          } catch {}
+
+          video.__feedTracker = tracker;
+          return tracker;
+        };
+
+        const playedSecondsFor = (tracker) => {
+          if (!tracker) return 0;
+          if (tracker.started_at !== null) {
+            return (tracker.play_ms + (performance.now() - tracker.started_at)) / 1000;
+          }
+          return tracker.play_ms / 1000;
+        };
+
+        const record = trackerFor(bestVideo);
+        try {
+          const playResult = bestVideo.play();
+          if (playResult && typeof playResult.catch === 'function') {
+            playResult.catch(() => {});
+          }
+        } catch {}
+
+        const duration = Number(bestVideo.duration || 0) || Number(record.last_duration || 0) || 0;
+        const currentTime = Number(bestVideo.currentTime || 0);
+        const playedSeconds = playedSecondsFor(record);
+        const ended = Boolean(bestVideo.ended)
+          || (duration > 0 && currentTime >= duration - 0.35)
+          || (duration > 0 && playedSeconds >= duration - 0.35);
+
+        return {
+          has_video: true,
+          ended,
+          paused: Boolean(bestVideo.paused),
+          playing: !Boolean(bestVideo.paused) && !Boolean(bestVideo.ended),
+          current_time: currentTime,
+          duration,
+          play_time: playedSeconds,
+          loop_count: Number(record.loop_count || 0),
+          duration_known: duration > 0,
+        };
+      }
+      """
+    )
+
+  def _play_visible_viewer_video(self, page) -> None:
+    muted = self.is_muted()
+    page.evaluate(
+      """
+      ({ muted }) => {
+        const vh = window.innerHeight || document.documentElement.clientHeight;
+        const vw = window.innerWidth || document.documentElement.clientWidth;
+        const videos = Array.from(document.querySelectorAll('video'));
+        for (const video of videos) {
+          const rect = video.getBoundingClientRect();
+          const visible = rect.bottom > 0 && rect.top < vh && rect.right > 0 && rect.left < vw;
+          if (!visible) continue;
+          const area = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0))
+            * Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
+          if (area < 12000) continue;
+
+          try {
+            video.muted = Boolean(muted);
+            if (!Boolean(muted)) {
+              video.volume = 1.0;
+            }
+          } catch {}
+
+          try {
+            const playResult = video.play();
+            if (playResult && typeof playResult.catch === 'function') {
+              playResult.catch(() => {});
+            }
+          } catch {}
+        }
+      }
+      """,
+      {"muted": bool(muted)},
+    )
+
   def _play_and_unmute_primary_video(self, page, target_url: str) -> None:
     muted = self.is_muted()
     page.evaluate(
@@ -1975,6 +2243,58 @@ class FeedScraper:
 
     return "done"
 
+  def _wait_viewer_video_or_timeout(self, page) -> str:
+    if not self.wait_video_end:
+      wait_result = self._wait_with_interrupt(self.image_dwell_seconds, page)
+      if wait_result in {"skip", "stop", "prev"}:
+        return wait_result
+      return "done"
+
+    start = time.time()
+    while not self._stop_event.is_set():
+      if self._wait_if_paused(page):
+        return "stop"
+      if self._consume_skip_request():
+        return "skip"
+
+      state = self._viewer_video_state(page)
+      if not state.get("has_video", False):
+        wait_result = self._wait_with_interrupt(self.image_dwell_seconds, page)
+        if wait_result in {"skip", "stop", "prev"}:
+          return wait_result
+        return "done"
+
+      play_time = float(state.get("play_time") or 0.0)
+      duration = float(state.get("duration") or 0.0)
+      loop_count = int(state.get("loop_count") or 0)
+
+      if duration > 0 and play_time >= max(0.0, duration - 0.35):
+        return "done"
+
+      if duration <= 0 and play_time >= max(2.0, float(self.image_dwell_seconds)):
+        return "done"
+
+      if duration > 0 and loop_count >= 1 and play_time >= max(duration, 2.0):
+        return "done"
+
+      if bool(state.get("paused", False)):
+        self._play_visible_viewer_video(page)
+
+      if bool(state.get("ended", False)):
+        return "done"
+
+      if (time.time() - start) >= self.max_video_wait_seconds:
+        self._log(
+          f"Aviso feed: maximo de espera de video alcanzado ({int(self.max_video_wait_seconds)}s), avanzando."
+        )
+        return "done"
+
+      wait_result = self._wait_with_interrupt(max(0.2, self.poll_seconds), page)
+      if wait_result in {"skip", "stop", "prev"}:
+        return wait_result
+
+    return "done"
+
   def _try_fullscreen_current_video(self, page, target_url: str, enter: bool) -> None:
     page.evaluate(
       """
@@ -2045,8 +2365,9 @@ class FeedScraper:
       return False
 
   def _process_twitter_carousel(self, page, target_url: str, media_count: int, in_viewer: bool = False) -> str | None:
-    # Si no hay carrusel, espera tiempo de imagen normal.
-    if media_count <= 1:
+    slides = min(max(1, int(media_count or 1)), 8)
+
+    if slides <= 1:
       wait_result = self._wait_with_interrupt(self.image_dwell_seconds, page)
       if wait_result == "skip":
         return "skip_post"
@@ -2055,126 +2376,87 @@ class FeedScraper:
         return "prev_post"
       if wait_result == "stop":
         return None
-      return
+      return None
 
-    slides = min(max(1, media_count), 4)
-    slide_index = 0
-    while slide_index < slides and not self._stop_event.is_set():
+    for slide_index in range(slides):
       if self._stop_event.is_set():
         return None
 
-      # Dentro del viewer modal, no entrar en fullscreen de video. Solo navegar slides.
-      # Los videos dentro del modal se reproducen sin fullscreen, con controles de carrusel visibles.
-      if in_viewer:
-        wait_result = self._wait_with_interrupt(self.image_dwell_seconds, page)
+      if self._consume_prev_request():
+        return "prev_post"
+
+      opened = False
+      if in_viewer and slide_index == 0:
+        opened = True
       else:
-        slide_is_video = bool(self._video_state_for_url(page, target_url).get("has_video", False))
-        if slide_is_video:
-          wait_result = self._wait_video_or_timeout(page, target_url)
-        else:
-          wait_result = self._wait_with_interrupt(self.image_dwell_seconds, page)
+        opened = self._open_twitter_media_at_index(page, target_url, slide_index)
+        if not opened and slide_index == 0:
+          opened = self._open_twitter_image_viewer(page, target_url)
 
-      if wait_result == "stop":
+      if not opened:
+        if slide_index == 0:
+          fallback_wait = self._wait_with_interrupt(self.image_dwell_seconds, page)
+          if fallback_wait == "skip":
+            return "skip_post"
+          if fallback_wait == "prev":
+            self._consume_prev_request()
+            return "prev_post"
+          return None
+        self._log(
+          f"Carrusel: no pude abrir media {slide_index + 1}/{slides} en {target_url}. Se continua al siguiente post."
+        )
+        return "skip_post"
+
+      settle_result = self._wait_with_interrupt(max(0.2, min(0.7, self.scroll_pause_seconds)), page)
+      if settle_result == "stop":
         return None
-      if wait_result == "skip":
+      if settle_result == "prev":
+        self._consume_prev_request()
+        return "prev_post"
+      if settle_result == "skip":
         if slide_index >= slides - 1:
-          self._log(f"Skip en carrusel: ultima imagen ({slide_index + 1}/{slides}), saliendo del post")
           return "skip_post"
-
-        self._log(f"Skip en carrusel: siguiente imagen ({slide_index + 1}/{slides})")
-        moved = self._twitter_click_next_media(page, target_url, in_viewer=in_viewer)
-        if not moved and in_viewer:
-          # En carrusel mixto, algunos videos abren un visor sin boton Next.
-          # Fallback: cerrar visor y abrir directamente el siguiente indice.
-          target_index = min(slides - 1, slide_index + 1)
-          moved = self._fallback_open_twitter_carousel_index(page, target_url, target_index, in_viewer=True)
-        if not moved:
-          self._log("Skip en carrusel: no pude avanzar a la siguiente imagen")
-          return "skip_post"
-        slide_index = min(slides - 1, slide_index + 1)
-        wait_result = self._wait_with_interrupt(max(0.15, self.poll_seconds * 0.5), page)
-        if wait_result == "stop":
-          return None
-        if wait_result == "prev":
-          if self._consume_prev_request():
-            if slide_index <= 0:
-              return "prev_post"
-            if self._twitter_click_previous_media(page, target_url, in_viewer=in_viewer):
-              self._log(f"Prev en carrusel: volviendo a imagen anterior ({slide_index + 1}/{slides})")
-              slide_index = max(0, slide_index - 1)
-              continue
-            if in_viewer:
-              target_index = max(0, slide_index - 1)
-              if self._fallback_open_twitter_carousel_index(page, target_url, target_index, in_viewer=True):
-                self._log(f"Prev en carrusel (fallback indice): {target_index + 1}/{slides}")
-                slide_index = target_index
-                continue
-            if slide_index <= 0:
-              return "prev_post"
-            self._log("Prev en carrusel: no pude volver a la imagen anterior")
-            return None
-        if wait_result == "skip" and slide_index >= slides - 1:
-          self._log(f"Skip en carrusel: ultima imagen ({slide_index + 1}/{slides}), saliendo del post")
-          return "skip_post"
+        try:
+          self._close_twitter_image_viewer(page)
+        except Exception:
+          pass
         continue
-      if wait_result == "prev":
-        if self._consume_prev_request():
-          if slide_index <= 0:
-            return "prev_post"
-          if self._twitter_click_previous_media(page, target_url, in_viewer=in_viewer):
-            self._log(f"Prev en carrusel: volviendo a imagen anterior ({slide_index + 1}/{slides})")
-            slide_index = max(0, slide_index - 1)
-            continue
-          if in_viewer:
-            target_index = max(0, slide_index - 1)
-            if self._fallback_open_twitter_carousel_index(page, target_url, target_index, in_viewer=True):
-              self._log(f"Prev en carrusel (fallback indice): {target_index + 1}/{slides}")
-              slide_index = target_index
-              continue
-          if slide_index <= 0:
-            return "prev_post"
-          self._log("Prev en carrusel: no pude volver a la imagen anterior")
-          return None
 
-      if slide_index >= slides - 1:
-        break
-      moved = self._twitter_click_next_media(page, target_url, in_viewer=in_viewer)
-      if not moved and in_viewer:
-        target_index = min(slides - 1, slide_index + 1)
-        moved = self._fallback_open_twitter_carousel_index(page, target_url, target_index, in_viewer=True)
-      if not moved:
-        break
-      slide_index = min(slides - 1, slide_index + 1)
-      wait_result = self._wait_with_interrupt(max(0.15, self.poll_seconds * 0.5), page)
-      if wait_result == "stop":
+      media_result = self._wait_viewer_video_or_timeout(page)
+      if media_result == "stop":
         return None
-      if wait_result == "skip":
-        if slide_index >= slides - 1:
-          self._log(f"Skip en carrusel: ultima imagen ({slide_index + 1}/{slides}), saliendo del post")
-          return "skip_post"
-        continue
-      if wait_result == "prev":
-        if self._consume_prev_request():
-          if slide_index <= 0:
-            return "prev_post"
-          if self._twitter_click_previous_media(page, target_url, in_viewer=in_viewer):
-            self._log(f"Prev en carrusel: volviendo a imagen anterior ({slide_index + 1}/{slides})")
-            slide_index = max(0, slide_index - 1)
-            continue
-          if in_viewer:
-            target_index = max(0, slide_index - 1)
-            if self._fallback_open_twitter_carousel_index(page, target_url, target_index, in_viewer=True):
-              self._log(f"Prev en carrusel (fallback indice): {target_index + 1}/{slides}")
-              slide_index = target_index
-              continue
-          if slide_index <= 0:
-            return "prev_post"
-          self._log("Prev en carrusel: no pude volver a la imagen anterior")
-          return None
+      if media_result == "prev":
+        self._consume_prev_request()
+        return "prev_post"
+      if media_result == "skip" and slide_index >= slides - 1:
+        try:
+          self._close_twitter_image_viewer(page)
+        except Exception:
+          pass
+        return "skip_post"
+
+      try:
+        self._close_twitter_image_viewer(page)
+      except Exception:
+        pass
+
+      post_close = self._wait_with_interrupt(max(0.12, self.poll_seconds * 0.35), page)
+      if post_close == "stop":
+        return None
+      if post_close == "prev":
+        self._consume_prev_request()
+        return "prev_post"
+      if post_close == "skip" and slide_index >= slides - 1:
+        return "skip_post"
 
     return None
 
   def _process_twitter_image_item(self, page, target_url: str, media_count: int) -> str | None:
+    total_media = max(1, int(media_count or 1))
+
+    if total_media > 1:
+      return self._process_twitter_carousel(page, target_url, total_media, in_viewer=False)
+
     try:
       opened = self._open_twitter_image_viewer(page, target_url)
     except Exception as exc:
@@ -2182,46 +2464,25 @@ class FeedScraper:
       opened = False
 
     if not opened:
-      return self._process_twitter_carousel(page, target_url, media_count)
-
-    try:
-      if int(media_count or 1) <= 1:
-        wait_result = self._wait_with_interrupt(self.image_dwell_seconds, page)
-        if wait_result == "stop":
-          return None
-        if wait_result == "prev":
-          self._consume_prev_request()
-          return "prev_post"
-        if wait_result == "skip":
-          self._consume_skip_request()
-          return "skip_post"
-        return None
-
-      # Dar tiempo para que se estabilice el viewer.
-      settle = self._wait_with_interrupt(max(0.35, min(0.9, self.scroll_pause_seconds)), page)
-      if settle == "stop":
-        self._log(f"Detenido durante settle (viewer abierto)")
-        return None
-      if settle == "prev":
-        self._log("Interrumpido durante settle (viewer abierto): prev")
+      wait_result = self._wait_with_interrupt(self.image_dwell_seconds, page)
+      if wait_result == "skip":
+        return "skip_post"
+      if wait_result == "prev":
         self._consume_prev_request()
         return "prev_post"
-      if settle == "skip":
-        self._log("Interrumpido durante settle (viewer abierto): skip")
+      return None
+
+    try:
+      wait_result = self._wait_viewer_video_or_timeout(page)
+      if wait_result == "stop":
+        return None
+      if wait_result == "prev":
+        self._consume_prev_request()
+        return "prev_post"
+      if wait_result == "skip":
         self._consume_skip_request()
         return "skip_post"
-
-      self._log(f"Procesando carousel con viewer abierto para {target_url}")
-      carousel_result = self._process_twitter_carousel(page, target_url, media_count, in_viewer=True)
-      self._log(f"Carousel terminado, resultado={carousel_result}")
-      return carousel_result
-    except Exception as exc:
-      self._log(f"Error en carousel con viewer: {exc}")
-      try:
-        self._close_twitter_image_viewer(page)
-      except Exception:
-        pass
-      raise
+      return None
     finally:
       try:
         self._close_twitter_image_viewer(page)

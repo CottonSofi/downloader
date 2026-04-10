@@ -42,6 +42,7 @@ browser_profiles/
 # Test / debug probe files
 *_probe.txt
 with_replies_probe.txt
+LEGACY_PARITY_AUDIT.md
 
 # Cookies and private session artifacts
 cookies/

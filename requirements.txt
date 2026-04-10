@@ -2,3 +2,4 @@ yt-dlp>=2024.5.27
 gallery-dl>=1.28.3
 imageio-ffmpeg>=0.5.1
 playwright>=1.44.0
+PyQt5>=5.15.11
