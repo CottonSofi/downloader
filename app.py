@@ -6,6 +6,9 @@ import shutil
 import subprocess
 import sys
 import threading
+
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+
 import time
 import urllib.request
 from typing import Any
@@ -105,12 +108,16 @@ class CoreBridge:
             "output_dir_var": "",
             "image_output_dir_var": "",
             "max_size_var": "50",
+            "max_size_unit_var": "MB",
             "start_var": "00:00",
             "end_var": "",
             "duration_var": "Duracion: -",
             "selected_language_var": "auto",
             "selected_quality_var": "best",
             "selected_audio_quality_var": "best audio",
+            "video_format_var": "mp4",
+            "audio_format_var": "mp3",
+            "download_mode_var": "BEST",
             "include_subtitles_var": False,
             "embed_subtitles_var": True,
             "subtitle_lang_var": "auto",
@@ -138,6 +145,7 @@ class CoreBridge:
             "x_actions_likes_var": True,
             "x_actions_retweets_var": False,
             "x_actions_profile_var": False,
+            "x_actions_cookie_var": "",
         }
 
         self._prepare_log_file()
@@ -146,6 +154,8 @@ class CoreBridge:
         self.monitors = self._detect_monitors()
         self._last_monitors_signature = tuple(self._monitor_identity(item) for item in self.monitors)
         self._ensure_default_paths()
+        if not str(self.get_var("cookies_file_var", "") or "").strip():
+            self._set_cookie_folder_choice(str(self.get_var("cookies_folder_var", "") or "").strip())
         if not self._global_cookie_choice:
             self._global_cookie_choice = str(self.get_var("cookies_file_var", "") or "").strip()
         self._log("Motor PyQt inicializado")
@@ -184,17 +194,18 @@ class CoreBridge:
 
     def _settings_payload(self) -> dict[str, Any]:
         keys = [
-            "url_var",
-            "instagram_url_var",
-            "twitter_url_var",
             "output_dir_var",
             "image_output_dir_var",
             "max_size_var",
+            "max_size_unit_var", 
             "start_var",
             "end_var",
             "selected_language_var",
             "selected_quality_var",
             "selected_audio_quality_var",
+            "video_format_var",
+            "audio_format_var",
+            "download_mode_var",
             "include_subtitles_var",
             "embed_subtitles_var",
             "subtitle_lang_var",
@@ -222,6 +233,7 @@ class CoreBridge:
             "x_actions_likes_var",
             "x_actions_retweets_var",
             "x_actions_profile_var",
+            "x_actions_cookie_var",
         ]
         return {key: self._vars.get(key) for key in keys}
 
@@ -379,6 +391,12 @@ class CoreBridge:
         browser = str(self.get_var("cookies_browser_var", "chrome")).strip() or "chrome"
         return ["--cookies-from-browser", browser]
 
+    def _cookie_args_for_download(self, cookie_file_override: str | None = None) -> list[str]:
+        forced_cookie = str(cookie_file_override or "").strip()
+        if forced_cookie and os.path.isfile(forced_cookie):
+            return ["--cookies", forced_cookie]
+        return self._cookie_args()
+
     def _subtitle_args(self) -> list[str]:
         args: list[str] = []
         if bool(self.get_var("include_subtitles_var", False)):
@@ -411,6 +429,7 @@ class CoreBridge:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    creationflags=CREATE_NO_WINDOW,
                 )
                 if proc.stdout is not None:
                     for line in proc.stdout:
@@ -546,34 +565,107 @@ class CoreBridge:
             args.extend(self._subtitle_args())
         return args
 
-    def _download_with_format(self, label: str, format_selector: str, extra_args: list[str] | None = None) -> None:
-        url = str(self.get_var("url_var", "")).strip()
-        if not self._looks_like_url(url):
-            self._log(f"[{label}] URL invalida")
-            return
-        cmd = self._yt_dlp_cmd() + self._common_download_args() + ["-f", format_selector]
-        if extra_args:
-            cmd.extend(extra_args)
-        cmd.append(url)
-        self._run_command_async(label, cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
+    def _get_effective_formats(self, is_video: bool) -> tuple[str, str]:
+        v_ext = str(self.get_var("video_format_var", "mp4")).strip().lower()
+        a_ext = str(self.get_var("audio_format_var", "mp3")).strip().lower()
 
-    def _download_with_audio_format(self, label: str, extra_args: list[str] | None = None) -> None:
+        valid_v = {"mp4", "mkv", "webm", "avi", "mov", "flv"}
+        valid_a = {"mp3", "m4a", "opus", "wav"}
+
+        if v_ext not in valid_v: v_ext = "mp4"
+        if a_ext not in valid_a: a_ext = "mp3"
+
+        # Regla: opus en contexto de video se mapea a salida webm (mp4 no maneja bien opus)
+        if is_video and a_ext == "opus" and v_ext == "mp4":
+            v_ext = "webm"
+
+        return v_ext, a_ext
+
+    def _execute_download_mode(self, mode: str) -> None:
+        self.set_var("download_mode_var", mode)
         url = str(self.get_var("url_var", "")).strip()
         if not self._looks_like_url(url):
-            self._log(f"[{label}] URL invalida")
+            self._log(f"[{mode}] URL invalida")
             return
-        audio_selector = self._audio_format_selector()
-        cmd = self._yt_dlp_cmd() + self._common_download_args(for_audio_only=True) + [
-            "-f",
-            audio_selector,
-            "-x",
-            "--audio-format",
-            "mp3",
-        ]
+
+        is_audio_only = mode in ["AUDIO_ONLY", "TRIM_AUDIO", "LIMIT_SIZE_AUDIO"]
+        is_video = not is_audio_only
+        is_video_only = mode in ["VIDEO_ONLY", "TRIM_VIDEO", "LIMIT_SIZE_VIDEO"]
+
+        v_ext, a_ext = self._get_effective_formats(is_video)
+        
+        self._log(f"[{mode}] Iniciando. Formato efectivo -> Video: {v_ext if is_video else 'N/A'}, Audio: {a_ext}")
+
+        cmd = self._yt_dlp_cmd() + self._common_download_args(for_audio_only=is_audio_only)
+        extra_args = []
+
+        if is_audio_only:
+            cmd.extend(["-f", self._audio_format_selector()])
+            cmd.extend(["-x", "--audio-format", a_ext])
+        else:
+            selector = self._video_format_selector()
+            if is_video_only:
+                selector = selector.split("+")[0]
+            cmd.extend(["-f", selector])
+
+            # Encoding arguments
+            if not is_video_only:
+                if v_ext == "mp4":
+                    extra_args.extend(["-S", "ext,vcodec:h264,acodec:m4a", "--recode-video", "mp4"])
+                else:
+                    extra_args.extend(["--recode-video", v_ext])
+            else:
+                if v_ext == "mp4":
+                    extra_args.extend(["-S", "ext,vcodec:h264", "--recode-video", "mp4"])
+                else:
+                    extra_args.extend(["--recode-video", v_ext])
+
+        # Mode specific arguments
+        if mode.startswith("LIMIT_SIZE"):
+            max_size_raw = str(self.get_var("max_size_var", "")).strip()
+            unit = str(self.get_var("max_size_unit_var", "MB")).strip().upper()
+            try:
+                max_val = float(max_size_raw)
+            except ValueError:
+                max_val = 0.0
+
+            if max_val > 0 and self._last_duration_seconds > 0:
+                # Convertir objetivo a kilobits (kb)
+                if unit == "KB":
+                    target_kb = max_val * 8.0
+                else:  # MB
+                    target_kb = max_val * 8192.0 # 1024 * 8
+                
+                # Calcular kbps totales requeridos (dejando 5% de margen para el contenedor)
+                total_kbps = int((target_kb / max(1, self._last_duration_seconds)) * 0.95)
+
+                if is_video and not is_video_only:
+                    audio_kbps = min(128, max(32, int(total_kbps * 0.15)))
+                    video_kbps = max(64, total_kbps - audio_kbps)
+                    extra_args.extend(["--postprocessor-args", f"ffmpeg:-b:v {video_kbps}k -maxrate {video_kbps}k -bufsize {video_kbps * 2}k -b:a {audio_kbps}k"])
+                elif is_video_only:
+                    video_kbps = max(64, total_kbps)
+                    extra_args.extend(["--postprocessor-args", f"ffmpeg:-b:v {video_kbps}k -maxrate {video_kbps}k -bufsize {video_kbps * 2}k"])
+                else:
+                    # Logica para limitar tamano SOLO AUDIO
+                    audio_kbps = max(32, total_kbps)
+                    extra_args.extend(["--postprocessor-args", f"ffmpeg:-b:a {audio_kbps}k -maxrate {audio_kbps}k -bufsize {audio_kbps * 2}k"])
+            else:
+                self._log("Limitar tamano: calculo abortado (falta cargar duracion o tamano invalido)")
+
+        if mode.startswith("TRIM"):
+            sections = self._download_sections_value()
+            if not sections:
+                self._log("Recortar segmento: falta Inicio/Fin")
+                return
+            # Se añadio el flag para forzar frames clave en los cortes y lograr precision milimetrica
+            extra_args.extend(["--download-sections", sections, "--force-keyframes-at-cuts"])
+
         if extra_args:
             cmd.extend(extra_args)
         cmd.append(url)
-        self._run_command_async(label, cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
+
+        self._run_command_async(mode, cmd, cwd=os.path.dirname(os.path.abspath(__file__)))
 
     def get_var(self, var_name: str, default: Any = "") -> Any:
         return self._vars.get(var_name, default)
@@ -854,6 +946,7 @@ class CoreBridge:
         media_urls: list[str] | None = None,
         output_dir_override: str | None = None,
         image_output_dir_override: str | None = None,
+        cookie_file_override: str | None = None,
     ) -> None:
         clean = (url or "").strip()
         if not clean:
@@ -871,6 +964,7 @@ class CoreBridge:
                 "media_urls": [str(item).strip() for item in (media_urls or []) if str(item).strip()],
                 "output_dir_override": (output_dir_override or "").strip(),
                 "image_output_dir_override": (image_output_dir_override or "").strip(),
+                "cookie_file_override": (cookie_file_override or "").strip(),
             }
         )
         self._log(f"Encolado para descarga automatica: {clean}")
@@ -890,6 +984,7 @@ class CoreBridge:
                 media_urls=list(payload.get("media_urls") or []),
                 output_dir_override=str(payload.get("output_dir_override") or "").strip() or None,
                 image_output_dir_override=str(payload.get("image_output_dir_override") or "").strip() or None,
+                cookie_file_override=str(payload.get("cookie_file_override") or "").strip() or None,
             )
             return
         self._queue_feed_download(str(payload or "").strip(), prefer_image_output=False, creator_hint=None)
@@ -930,6 +1025,20 @@ class CoreBridge:
             except Exception:
                 break
 
+    def _release_x_actions_url_on_failure(self, url: str) -> None:
+        clean = str(url or "").strip()
+        if not clean:
+            return
+
+        self.x_actions_seen_urls.discard(clean)
+        for seen_urls in self.x_actions_seen_urls_by_label.values():
+            seen_urls.discard(clean)
+
+        status_id = self._status_id_from_url(clean)
+        if isinstance(status_id, int):
+            for seen_status_ids in self.x_actions_seen_status_ids_by_label.values():
+                seen_status_ids.discard(status_id)
+
     def _feed_download_worker(self) -> None:
         self._log("Worker de feed iniciado")
         try:
@@ -941,6 +1050,7 @@ class CoreBridge:
                         break
                     continue
 
+                current_url = ""
                 try:
                     if isinstance(payload, dict):
                         url = str(payload.get("url") or "").strip()
@@ -950,6 +1060,7 @@ class CoreBridge:
                         media_urls = [str(item).strip() for item in (payload.get("media_urls") or []) if str(item).strip()]
                         output_dir_override = str(payload.get("output_dir_override") or "").strip() or None
                         image_output_dir_override = str(payload.get("image_output_dir_override") or "").strip() or None
+                        cookie_file_override = str(payload.get("cookie_file_override") or "").strip() or None
                     else:
                         url = str(payload or "").strip()
                         prefer_image_output = False
@@ -958,23 +1069,49 @@ class CoreBridge:
                         media_urls = []
                         output_dir_override = None
                         image_output_dir_override = None
+                        cookie_file_override = None
 
                     if not url:
                         continue
 
+                    current_url = url
+
                     if self._is_twitter_url(url) and not creator_hint:
                         creator_hint = self._twitter_creator_from_url(url)
 
-                    if media_kind in {"image", "carousel"} or media_urls:
+                    is_video_kind = media_kind in {"video", "carousel_video"}
+                    is_image_kind = media_kind in {"image", "carousel"}
+
+                    if is_image_kind and not is_video_kind:
+                        prefer_image_output = True
+                    elif is_video_kind:
+                        prefer_image_output = False
+                    elif media_urls:
                         prefer_image_output = True
 
-                    if prefer_image_output:
-                        out_dir = self._build_image_output_dir(url, creator_hint=creator_hint, root_override=image_output_dir_override)
-                        saved = self._download_twitter_media_urls(media_urls, out_dir)
+                    download_images_first = bool(media_urls) and (
+                        is_image_kind or media_kind == "carousel_video" or prefer_image_output
+                    )
+                    image_out_dir: str | None = None
+                    if download_images_first:
+                        image_out_dir = self._build_image_output_dir(
+                            url,
+                            creator_hint=creator_hint,
+                            root_override=image_output_dir_override,
+                        )
+                        saved = self._download_twitter_media_urls(media_urls, image_out_dir)
                         if saved:
                             self._log(f"Imagenes guardadas ({len(saved)}): {url}")
-                            self._remember_downloaded_status(url)
-                            continue
+                            if prefer_image_output and not is_video_kind:
+                                self._remember_downloaded_status(url)
+                                continue
+
+                    if prefer_image_output and not is_video_kind:
+                        out_dir = image_out_dir or self._build_image_output_dir(
+                            url,
+                            creator_hint=creator_hint,
+                            root_override=image_output_dir_override,
+                        )
 
                         if self._looks_like_image_url(url):
                             saved_single = self._download_direct_image(url, out_dir)
@@ -984,7 +1121,8 @@ class CoreBridge:
                                 continue
 
                         output_template = os.path.join(out_dir, "%(title).120s [%(id)s].%(ext)s")
-                        cmd = self._yt_dlp_cmd() + ["--no-playlist", "-o", output_template] + self._cookie_args() + [url]
+                        cmd = self._yt_dlp_cmd() + ["--no-playlist", "-o", output_template] + self._cookie_args_for_download(cookie_file_override) + [url]
+                        strict_twitter_mode = False
                     else:
                         out_dir = self._feed_output_dir_for_url(url, creator_hint=creator_hint, root_override=output_dir_override)
                         output_template = os.path.join(out_dir, "%(title).120s [%(id)s].%(ext)s")
@@ -994,14 +1132,17 @@ class CoreBridge:
                                 "--no-playlist",
                                 "-f",
                                 "bestvideo*+bestaudio/best",
-                                "--merge-output-format",
+                                "-S",
+                                "ext,vcodec:h264,acodec:m4a",
+                                "--recode-video",
                                 "mp4",
                                 "-o",
                                 output_template,
                             ]
-                            + self._cookie_args()
+                            + self._cookie_args_for_download(cookie_file_override)
                             + [url]
                         )
+                        strict_twitter_mode = bool(self._is_twitter_url(url))
 
                     proc = subprocess.run(
                         cmd,
@@ -1011,17 +1152,45 @@ class CoreBridge:
                         errors="replace",
                         cwd=os.path.dirname(os.path.abspath(__file__)),
                         check=False,
+                        creationflags=CREATE_NO_WINDOW,
                     )
+
+                    if proc.returncode != 0 and strict_twitter_mode:
+                        fallback_cmd = (
+                            self._yt_dlp_cmd()
+                            + ["--no-playlist", "-o", output_template]
+                            + self._cookie_args_for_download(cookie_file_override)
+                            + [url]
+                        )
+                        fallback_proc = subprocess.run(
+                            fallback_cmd,
+                            capture_output=True,
+                            text=True,
+                            encoding="utf-8",
+                            errors="replace",
+                            cwd=os.path.dirname(os.path.abspath(__file__)),
+                            check=False,
+                            creationflags=CREATE_NO_WINDOW,
+                        )
+                        if fallback_proc.returncode == 0:
+                            proc = fallback_proc
+                            self._log(f"Feed fallback compatible OK: {url}")
+                        else:
+                            proc = fallback_proc
+
                     if proc.returncode == 0:
                         self._remember_downloaded_status(url)
                         self._log(f"Feed descargado: {url}")
                     else:
+                        self._release_x_actions_url_on_failure(url)
                         raw_error = str(proc.stdout or proc.stderr or "").strip()
                         summary = raw_error.splitlines()[-1].strip() if raw_error else "sin detalle"
                         self._log(f"Feed fallo ({url}): {summary}")
                 except Exception as exc:
                     self._log(f"Feed worker error: {exc}")
                 finally:
+                    if current_url:
+                        self.feed_urls_queued.discard(current_url)
                     self.feed_download_queue.task_done()
         finally:
             self.feed_worker_running = False
@@ -1087,6 +1256,7 @@ class CoreBridge:
             errors="replace",
             cwd=os.path.dirname(os.path.abspath(__file__)),
             check=False,
+            creationflags=CREATE_NO_WINDOW,
         )
         if proc.returncode != 0:
             self._log(f"Cargar info fallo: {proc.stdout or proc.stderr}")
@@ -1125,49 +1295,31 @@ class CoreBridge:
         self.load_video_info()
 
     def download_best(self) -> None:
-        self._download_with_format(
-            "BEST",
-            self._video_format_selector(),
-            extra_args=["--merge-output-format", "mp4"],
-        )
+        self._execute_download_mode("BEST")
 
     def download_audio_only(self) -> None:
-        self._download_with_audio_format("AUDIO")
+        self._execute_download_mode("AUDIO_ONLY")
 
     def download_video_only(self) -> None:
-        selector = self._video_format_selector().split("+")[0]
-        self._download_with_format("VIDEO_ONLY", selector, extra_args=["--merge-output-format", "mp4"])
+        self._execute_download_mode("VIDEO_ONLY")
 
     def download_limited_size(self) -> None:
-        max_size_mb = str(self.get_var("max_size_var", "")).strip()
-        extra: list[str] = ["--merge-output-format", "mp4", "--recode-video", "mp4"]
-        try:
-            max_mb = float(max_size_mb)
-        except Exception:
-            max_mb = 0.0
-        if max_mb > 1 and self._last_duration_seconds > 0:
-            total_kbps = max(256, int((max_mb * 8192.0) / max(1, self._last_duration_seconds) * 0.92))
-            video_kbps = max(160, total_kbps - 128)
-            extra.extend(
-                [
-                    "--postprocessor-args",
-                    f"ffmpeg:-b:v {video_kbps}k -maxrate {video_kbps}k -bufsize {video_kbps * 2}k -b:a 128k",
-                ]
-            )
-        else:
-            self._log("Limitar tamano: usando modo aproximado (falta duracion o tamano valido)")
-        self._download_with_format("LIMIT_SIZE", self._video_format_selector(), extra_args=extra)
+        self._execute_download_mode("LIMIT_SIZE")
+
+    def download_audio_limited_size(self) -> None:
+        self._execute_download_mode("LIMIT_SIZE_AUDIO")
+
+    def download_video_limited_size(self) -> None:
+        self._execute_download_mode("LIMIT_SIZE_VIDEO")
 
     def download_trimmed(self) -> None:
-        sections = self._download_sections_value()
-        if not sections:
-            self._log("Recortar segmento: falta Inicio/Fin")
-            return
-        self._download_with_format(
-            "TRIM",
-            self._video_format_selector(),
-            extra_args=["--download-sections", sections, "--merge-output-format", "mp4"],
-        )
+        self._execute_download_mode("TRIM")
+
+    def download_audio_trimmed(self) -> None:
+        self._execute_download_mode("TRIM_AUDIO")
+
+    def download_video_trimmed(self) -> None:
+        self._execute_download_mode("TRIM_VIDEO")
 
     def download_instagram_best(self) -> None:
         url = str(self.get_var("instagram_url_var", "")).strip()
@@ -1209,15 +1361,93 @@ class CoreBridge:
         folder = str(self.get_var("cookies_folder_var", "")).strip()
         if not folder:
             folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies")
-        if not os.path.isdir(folder):
+        return self._scan_cookie_files_in_folder(folder, recursive=True)
+
+    def _scan_cookie_files_in_folder(self, folder: str, recursive: bool = True) -> list[str]:
+        clean_folder = str(folder or "").strip()
+        if not clean_folder or not os.path.isdir(clean_folder):
             return []
+
         out: list[str] = []
-        for name in os.listdir(folder):
-            path = os.path.join(folder, name)
-            if os.path.isfile(path) and (name.lower().endswith(".txt") or name.lower().endswith(".json")):
-                out.append(path)
-        out.sort()
+        seen: set[str] = set()
+
+        def add_path(path: str) -> None:
+            if not path or not os.path.isfile(path):
+                return
+            key = os.path.normcase(os.path.abspath(path))
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(path)
+
+        try:
+            if recursive:
+                walker = os.walk(clean_folder)
+                for dirpath, _dirnames, filenames in walker:
+                    for name in filenames:
+                        lower = name.lower()
+                        if lower.endswith(".txt") or lower.endswith(".json"):
+                            add_path(os.path.join(dirpath, name))
+            else:
+                for name in os.listdir(clean_folder):
+                    lower = name.lower()
+                    if not (lower.endswith(".txt") or lower.endswith(".json")):
+                        continue
+                    add_path(os.path.join(clean_folder, name))
+        except Exception:
+            return []
+
+        out.sort(key=lambda path: os.path.relpath(path, clean_folder).replace("\\", "/").lower())
         return out
+
+    def _pick_default_cookie_file(self, paths: list[str]) -> str:
+        files = [str(item).strip() for item in (paths or []) if str(item).strip() and os.path.isfile(str(item).strip())]
+        if not files:
+            return ""
+
+        def rank(path: str) -> tuple[int, int, int, str]:
+            name = os.path.basename(path).lower()
+            is_txt = 0 if name.endswith(".txt") else 1
+            has_cookie_word = 0 if "cookie" in name else 1
+            has_twitter_word = 0 if ("twitter" in name or "x" in name) else 1
+            return (is_txt, has_cookie_word, has_twitter_word, name)
+
+        files.sort(key=rank)
+        return files[0]
+
+    def _set_cookie_folder_choice(self, folder: str) -> None:
+        clean_folder = str(folder or "").strip()
+        self.set_var("cookies_folder_var", clean_folder)
+
+        pool = self._scan_cookie_files_in_folder(clean_folder, recursive=True)
+        current = str(self.get_var("cookies_file_var", "") or "").strip()
+        current_key = os.path.normcase(os.path.abspath(current)) if current and os.path.isfile(current) else ""
+        pool_keys = {os.path.normcase(os.path.abspath(path)) for path in pool}
+
+        if current_key and current_key in pool_keys:
+            chosen = current
+        else:
+            chosen = self._pick_default_cookie_file(pool)
+
+        self.set_var("cookies_file_var", chosen)
+        if not str(self._global_cookie_choice or "").strip() and chosen:
+            self._global_cookie_choice = chosen
+
+        if chosen:
+            self._log(f"Cookie activa por carpeta: {self._cookie_label(chosen)}")
+        else:
+            self._log("No se encontraron cookies en la carpeta seleccionada")
+
+    def _set_cookie_file_choice(self, path: str) -> None:
+        clean = str(path or "").strip()
+        self.set_var("cookies_file_var", clean)
+        if clean and os.path.isfile(clean):
+            folder = os.path.dirname(clean)
+            if folder:
+                self.set_var("cookies_folder_var", folder)
+            self._log(f"Cookie activa: {self._cookie_label(clean)}")
+        else:
+            self._log("Cookie activa: sin cookies")
 
     def _cookie_label(self, path: str) -> str:
         path = str(path or "").strip()
@@ -1239,8 +1469,44 @@ class CoreBridge:
         self._global_cookie_choice = str(path or "")
         self._log(f"Cookie global: {self._cookie_label(path)}")
 
+    def _set_x_actions_cookie_choice(self, path: str) -> None:
+        clean = str(path or "").strip()
+        self.set_var("x_actions_cookie_var", clean)
+        if clean:
+            self._log(f"Cookie monitor X: {self._cookie_label(clean)}")
+        else:
+            self._log("Cookie monitor X: usar cookie global")
+
     def _selected_global_cookie(self) -> str:
         return str(self._global_cookie_choice or "")
+
+    def _selected_x_actions_cookie(self) -> str:
+        return str(self.get_var("x_actions_cookie_var", "") or "").strip()
+
+    def _effective_x_actions_cookie(self) -> str:
+        selected = self._selected_x_actions_cookie()
+        if selected:
+            return selected
+
+        global_cookie = str(self._selected_global_cookie() or "").strip()
+        if global_cookie:
+            return global_cookie
+
+        cookie_var = str(self.get_var("cookies_file_var", "") or "").strip()
+        if cookie_var:
+            return cookie_var
+
+        existing = self._existing_cookie_files()
+        if existing:
+            return str(existing[0] or "").strip()
+        return ""
+
+    def _x_actions_cookie_display(self) -> str:
+        selected = self._selected_x_actions_cookie()
+        if selected:
+            return self._cookie_label(selected)
+        global_label = self._cookie_label(self._effective_x_actions_cookie())
+        return f"usar global ({global_label})"
 
     def _selected_cookie_for_monitor(self, monitor_id: int) -> str:
         monitor_id = int(monitor_id)
@@ -1296,10 +1562,8 @@ class CoreBridge:
             if not clean_dir or not os.path.isdir(clean_dir):
                 continue
             try:
-                for name in sorted(os.listdir(clean_dir), key=lambda item: item.lower()):
-                    lower = name.lower()
-                    if lower.endswith(".txt") and "cookie" in lower:
-                        add_file(os.path.join(clean_dir, name))
+                for path in self._scan_cookie_files_in_folder(clean_dir, recursive=True):
+                    add_file(path)
             except Exception:
                 pass
 
@@ -1321,6 +1585,7 @@ class CoreBridge:
                 errors="replace",
                 timeout=timeout,
                 check=False,
+                creationflags=CREATE_NO_WINDOW,
             )
             last = proc
             if proc.returncode == 0:
@@ -1571,6 +1836,11 @@ class CoreBridge:
     def _urls_from_gallery_dl_output(self, source_url: str, stdout: str) -> list[dict[str, Any]]:
         _ = source_url
 
+        status_url_pattern = re.compile(
+            r"https?://(?:www\.)?(?:x|twitter)\.com/(?:[^/\s?#]+/status/\d+|i(?:/web)?/status/\d+)",
+            flags=re.IGNORECASE,
+        )
+
         def extract_handle(raw_value: object) -> str | None:
             if isinstance(raw_value, str):
                 maybe = raw_value.strip().lstrip("@")
@@ -1583,52 +1853,180 @@ class CoreBridge:
                         return maybe
             return None
 
-        def collect_from_item(item: dict[str, Any], bag: list[dict[str, Any]]) -> None:
+        def media_hints_from_url(raw_url: str) -> tuple[bool, bool]:
+            text = str(raw_url or "").strip().lower()
+            if not text:
+                return (False, False)
+            clean = text.split("?", 1)[0]
+            has_video = (
+                "video.twimg.com" in text
+                or "/ext_tw_video/" in text
+                or clean.endswith(".mp4")
+                or clean.endswith(".m3u8")
+            )
+            has_image = (
+                "pbs.twimg.com/media/" in text
+                or ("twimg.com" in text and "/media/" in text)
+                or clean.endswith(".jpg")
+                or clean.endswith(".jpeg")
+                or clean.endswith(".png")
+                or clean.endswith(".webp")
+            )
+            return (has_video, has_image)
+
+        def add_status_row(
+            raw_status_url: str,
+            bag: list[dict[str, Any]],
+            *,
+            has_video: bool = False,
+            has_image: bool = False,
+            author_handle: str | None = None,
+            actor_handle: str | None = None,
+        ) -> None:
+            canonical = self._canonical_twitter_status_url(str(raw_status_url or ""))
+            if not canonical:
+                return
+            has_video_bool = bool(has_video)
+            has_image_bool = bool(has_image)
+            bag.append(
+                {
+                    "url": canonical,
+                    "status_id": self._status_id_from_url(canonical),
+                    "has_video": has_video_bool,
+                    "has_image": has_image_bool,
+                    "has_media": bool(has_video_bool or has_image_bool),
+                    "author_handle": author_handle,
+                    "actor_handle": actor_handle,
+                }
+            )
+
+        def collect_from_item(
+            item: dict[str, Any],
+            bag: list[dict[str, Any]],
+            *,
+            force_has_video: bool = False,
+            force_has_image: bool = False,
+        ) -> None:
             candidates: list[str] = []
-            for key in ("url", "post_url", "tweet_url", "original_url"):
+            for key in ("url", "post_url", "tweet_url", "original_url", "status_url", "permalink", "permalink_url"):
                 value = item.get(key)
                 if isinstance(value, str) and value.strip():
                     candidates.append(value)
 
-            tweet_id = item.get("tweet_id") or item.get("id")
+            tweet_id_raw = item.get("tweet_id") or item.get("status_id")
+            if tweet_id_raw is None:
+                looks_like_tweet = any(
+                    key in item
+                    for key in (
+                        "content",
+                        "text",
+                        "full_text",
+                        "conversation_id",
+                        "favorite_count",
+                        "retweet_count",
+                        "reply_count",
+                        "quote_count",
+                    )
+                )
+                looks_like_profile = any(
+                    key in item
+                    for key in (
+                        "followers_count",
+                        "friends_count",
+                        "statuses_count",
+                        "profile_image",
+                    )
+                )
+                if looks_like_tweet and not looks_like_profile:
+                    tweet_id_raw = item.get("id")
+            tweet_id = ""
+            if tweet_id_raw is not None:
+                tweet_id_match = re.search(r"\d{8,25}", str(tweet_id_raw))
+                if tweet_id_match:
+                    tweet_id = tweet_id_match.group(0)
+
             raw_user = item.get("author") or item.get("user") or item.get("screen_name")
             user_candidate = extract_handle(raw_user)
-            actor_candidate = extract_handle(item.get("user"))
+            actor_candidate = extract_handle(item.get("user")) or extract_handle(item.get("actor"))
 
             if tweet_id:
                 if user_candidate:
                     candidates.append(f"https://x.com/{user_candidate}/status/{tweet_id}")
                 candidates.append(f"https://x.com/i/web/status/{tweet_id}")
 
-            has_video = self._gallery_item_has_video(item)
-            has_image = self._gallery_item_has_image(item)
-            has_media = has_video or has_image
+            has_video = bool(force_has_video or self._gallery_item_has_video(item))
+            has_image = bool(force_has_image or self._gallery_item_has_image(item))
 
             for candidate in candidates:
-                canonical = self._canonical_twitter_status_url(str(candidate))
-                if canonical:
-                    bag.append(
-                        {
-                            "url": canonical,
-                            "status_id": self._status_id_from_url(canonical),
-                            "has_video": has_video,
-                            "has_image": has_image,
-                            "has_media": has_media,
-                            "author_handle": user_candidate,
-                            "actor_handle": actor_candidate,
-                        }
+                add_status_row(
+                    str(candidate),
+                    bag,
+                    has_video=has_video,
+                    has_image=has_image,
+                    author_handle=user_candidate,
+                    actor_handle=actor_candidate,
+                )
+
+            for key in ("content", "text", "full_text", "description"):
+                value = item.get(key)
+                if not isinstance(value, str):
+                    continue
+                for match in status_url_pattern.finditer(value):
+                    add_status_row(
+                        match.group(0),
+                        bag,
+                        has_video=has_video,
+                        has_image=has_image,
+                        author_handle=user_candidate,
+                        actor_handle=actor_candidate,
                     )
 
         out: list[dict[str, Any]] = []
 
-        def collect_from_unknown(payload: object) -> None:
+        def collect_from_unknown(payload: object, inherit_video: bool = False, inherit_image: bool = False) -> None:
             if isinstance(payload, dict):
-                collect_from_item(payload, out)
+                collect_from_item(
+                    payload,
+                    out,
+                    force_has_video=inherit_video,
+                    force_has_image=inherit_image,
+                )
+                for value in payload.values():
+                    if isinstance(value, (dict, list, tuple)):
+                        collect_from_unknown(value, inherit_video, inherit_image)
                 return
-            if isinstance(payload, list):
+
+            if isinstance(payload, (list, tuple)):
+                local_video = bool(inherit_video)
+                local_image = bool(inherit_image)
+
                 for entry in payload:
-                    if isinstance(entry, dict):
-                        collect_from_item(entry, out)
+                    if isinstance(entry, str):
+                        hint_video, hint_image = media_hints_from_url(entry)
+                        local_video = bool(local_video or hint_video)
+                        local_image = bool(local_image or hint_image)
+                        for match in status_url_pattern.finditer(entry):
+                            add_status_row(
+                                match.group(0),
+                                out,
+                                has_video=local_video,
+                                has_image=local_image,
+                            )
+
+                for entry in payload:
+                    if isinstance(entry, (dict, list, tuple)):
+                        collect_from_unknown(entry, local_video, local_image)
+                return
+
+            if isinstance(payload, str):
+                hint_video, hint_image = media_hints_from_url(payload)
+                for match in status_url_pattern.finditer(payload):
+                    add_status_row(
+                        match.group(0),
+                        out,
+                        has_video=bool(inherit_video or hint_video),
+                        has_image=bool(inherit_image or hint_image),
+                    )
 
         full_text = (stdout or "").strip()
         if full_text:
@@ -1647,6 +2045,9 @@ class CoreBridge:
             except Exception:
                 continue
             collect_from_unknown(item)
+
+        for match in status_url_pattern.finditer(stdout or ""):
+            add_status_row(match.group(0), out)
 
         unique: list[dict[str, Any]] = []
         seen_by_status: dict[int, int] = {}
@@ -1668,6 +2069,8 @@ class CoreBridge:
                     row["has_media"] = bool(row.get("has_media", False) or item.get("has_media", False))
                     if not row.get("author_handle") and item.get("author_handle"):
                         row["author_handle"] = item.get("author_handle")
+                    if not row.get("actor_handle") and item.get("actor_handle"):
+                        row["actor_handle"] = item.get("actor_handle")
                     continue
 
             if url in seen_by_url:
@@ -1677,6 +2080,8 @@ class CoreBridge:
                 row["has_media"] = bool(row.get("has_media", False) or item.get("has_media", False))
                 if not row.get("author_handle") and item.get("author_handle"):
                     row["author_handle"] = item.get("author_handle")
+                if not row.get("actor_handle") and item.get("actor_handle"):
+                    row["actor_handle"] = item.get("actor_handle")
                 continue
 
             unique.append(item)
@@ -1686,9 +2091,14 @@ class CoreBridge:
                 seen_by_status[status_id] = new_index
         return unique
 
-    def _fetch_x_action_urls(self, source_url: str, limit: int = X_ACTION_RANGE) -> list[dict[str, Any]]:
+    def _fetch_x_action_urls(
+        self,
+        source_url: str,
+        limit: int = X_ACTION_RANGE,
+        cookie_file_override: str | None = None,
+    ) -> list[dict[str, Any]]:
         args = [
-            *self._gallery_dl_common_args(log_usage=False),
+            *self._gallery_dl_common_args(cookie_file_override=cookie_file_override, log_usage=False),
             "--range",
             f"1-{max(1, int(limit))}",
             "--dump-json",
@@ -1706,8 +2116,24 @@ class CoreBridge:
             self._log(f"X monitor: 0 URLs parseadas en {source_url}. Muestra salida: {snippet}")
         return rows
 
-    def _playwright_cookie_candidates(self) -> list[str]:
-        return [path for path in self._existing_cookie_files() if path.lower().endswith(".txt")]
+    def _playwright_cookie_candidates(self, cookie_file_override: str | None = None) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+
+        def add(path: str) -> None:
+            clean = str(path or "").strip()
+            if not clean or not os.path.isfile(clean) or not clean.lower().endswith(".txt"):
+                return
+            key = os.path.normcase(os.path.abspath(clean))
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(clean)
+
+        add(cookie_file_override or "")
+        for path in self._existing_cookie_files():
+            add(path)
+        return out
 
     def _load_netscape_cookies_for_playwright(self, file_path: str) -> list[dict[str, Any]]:
         cookies: list[dict[str, Any]] = []
@@ -1745,13 +2171,20 @@ class CoreBridge:
             self._log(f"X monitor: no pude leer cookies para Playwright ({exc})")
         return cookies
 
-    def _fetch_retweet_urls_from_html(self, user: str, limit: int = 60) -> list[str]:
+    def _fetch_retweet_urls_from_html(
+        self,
+        user: str,
+        limit: int = 60,
+        cookie_file_override: str | None = None,
+    ) -> list[str]:
         clean_user = (user or "").strip().lstrip("@")
         if not clean_user:
             return []
 
         now = time.time()
-        cached = self.x_retweet_html_cache.get(clean_user.lower())
+        cookie_key = str(cookie_file_override or "").strip().lower()
+        cache_key = f"{clean_user.lower()}::{cookie_key}"
+        cached = self.x_retweet_html_cache.get(cache_key)
         if cached and (now - float(cached[0])) < 40.0:
             return list(cached[1])
 
@@ -1762,7 +2195,7 @@ class CoreBridge:
             return []
 
         urls: list[str] = []
-        cookie_files = self._playwright_cookie_candidates()
+        cookie_files = self._playwright_cookie_candidates(cookie_file_override)
 
         try:
             with sync_playwright() as p:
@@ -1853,7 +2286,7 @@ class CoreBridge:
             self._log(f"X monitor: fallback HTML retweets fallo ({exc})")
             return []
 
-        self.x_retweet_html_cache[clean_user.lower()] = (time.time(), urls)
+        self.x_retweet_html_cache[cache_key] = (time.time(), urls)
         return urls
 
     def _run_x_actions_monitor(self) -> None:
@@ -1874,7 +2307,9 @@ class CoreBridge:
                         else:
                             self._log("X monitor: sin usuario explicito; se procesaran solo fuentes que no lo requieren.")
 
-                    if not self._existing_cookie_files():
+                    x_actions_cookie = str(self._effective_x_actions_cookie() or "").strip()
+                    has_cookie_file = bool(x_actions_cookie and os.path.isfile(x_actions_cookie))
+                    if not has_cookie_file and not self._existing_cookie_files():
                         self._log("X monitor: no hay cookies disponibles, no se puede leer acciones privadas.")
                     else:
                         for label, source_url in sources:
@@ -1884,7 +2319,11 @@ class CoreBridge:
                             self._log(f"X monitor: consultando {label} -> {source_url}")
                             label_key = label.lower()
                             limit = max(X_ACTION_RANGE, 40) if label_key == "retweets" else X_ACTION_RANGE
-                            found_rows = self._fetch_x_action_urls(source_url, limit=limit)
+                            found_rows = self._fetch_x_action_urls(
+                                source_url,
+                                limit=limit,
+                                cookie_file_override=x_actions_cookie,
+                            )
                             if not found_rows:
                                 self._log(f"X monitor: sin items detectables en {label} para esta revision.")
                                 continue
@@ -1928,7 +2367,15 @@ class CoreBridge:
                                             if not prev.get("author_handle") and row.get("author_handle"):
                                                 prev["author_handle"] = str(row.get("author_handle") or "").strip()
 
-                                    html_urls = self._fetch_retweet_urls_from_html(monitored_user, limit=90) if monitored_user else []
+                                    html_urls = (
+                                        self._fetch_retweet_urls_from_html(
+                                            monitored_user,
+                                            limit=90,
+                                            cookie_file_override=x_actions_cookie,
+                                        )
+                                        if monitored_user
+                                        else []
+                                    )
                                     for html_url in html_urls:
                                         canonical = self._canonical_twitter_status_url(html_url)
                                         if not canonical or canonical in seen_candidate_urls:
@@ -1958,140 +2405,151 @@ class CoreBridge:
                                             }
                                         )
 
-                                    if not candidate_rows_unique:
-                                        for row in found_rows:
-                                            item_url = self._canonical_twitter_status_url(str(row.get("url") or ""))
-                                            if not item_url or item_url in seen_candidate_urls:
-                                                continue
-                                            if not bool(row.get("has_media", False)):
-                                                continue
-                                            seen_candidate_urls.add(item_url)
-                                            row_copy = dict(row)
-                                            row_copy["url"] = item_url
-                                            candidate_rows_unique.append(row_copy)
-
-                                    self._log(f"X monitor: retweets HTML detecto {len(candidate_rows_unique)} URL(s).")
-                                else:
+                                if not candidate_rows_unique:
                                     for row in found_rows:
-                                        item_url = str(row.get("url") or "").strip()
-                                        if not item_url:
+                                        item_url = self._canonical_twitter_status_url(str(row.get("url") or ""))
+                                        if not item_url or item_url in seen_candidate_urls:
                                             continue
                                         if not bool(row.get("has_media", False)):
                                             continue
-                                        if item_url in seen_candidate_urls:
-                                            continue
                                         seen_candidate_urls.add(item_url)
-                                        candidate_rows_unique.append(row)
+                                        row_copy = dict(row)
+                                        row_copy["url"] = item_url
+                                        candidate_rows_unique.append(row_copy)
 
-                                candidate_urls = [str(r.get("url") or "").strip() for r in candidate_rows_unique]
-                                candidate_media_count = sum(1 for r in candidate_rows_unique if bool(r.get("has_media", False)))
+                                self._log(f"X monitor: retweets HTML detecto {len(candidate_rows_unique)} URL(s).")
+                            else:
+                                for row in found_rows:
+                                    item_url = str(row.get("url") or "").strip()
+                                    if not item_url:
+                                        continue
+                                    if not bool(row.get("has_media", False)):
+                                        continue
+                                    if item_url in seen_candidate_urls:
+                                        continue
+                                    seen_candidate_urls.add(item_url)
+                                    candidate_rows_unique.append(row)
 
-                                if label_key == "retweets":
-                                    self._log(
-                                        f"X monitor: retweets candidatos tras filtro={len(candidate_urls)}, "
-                                        f"con_media={candidate_media_count}, fuente={source_url}"
-                                    )
+                            candidate_urls = [str(r.get("url") or "").strip() for r in candidate_rows_unique]
+                            candidate_media_count = sum(1 for r in candidate_rows_unique if bool(r.get("has_media", False)))
 
-                                seen_for_label = self.x_actions_seen_urls_by_label.setdefault(label_key, set())
-                                seen_status_ids_for_label = self.x_actions_seen_status_ids_by_label.setdefault(label_key, set())
+                            if label_key == "retweets":
+                                self._log(
+                                    f"X monitor: retweets candidatos tras filtro={len(candidate_urls)}, "
+                                    f"con_media={candidate_media_count}, fuente={source_url}"
+                                )
 
-                                if not seen_for_label:
-                                    seen_for_label.update(candidate_urls)
-                                    self.x_actions_seen_urls.update(candidate_urls)
-                                    if label_key == "retweets":
-                                        baseline_ids = {
-                                            sid
-                                            for sid in (self._status_id_from_url(url_item) for url_item in candidate_urls)
-                                            if isinstance(sid, int)
-                                        }
-                                        seen_status_ids_for_label.update(baseline_ids)
-                                    if label_key == "retweets":
-                                        self._log(
-                                            f"X monitor: baseline por URL cargado para {label} "
-                                            f"({len(candidate_urls)} URL(s), media={candidate_media_count})."
-                                        )
-                                    else:
-                                        self._log(f"X monitor: baseline por URL cargado para {label} ({len(candidate_urls)} URL(s) con media).")
-                                    continue
+                            seen_for_label = self.x_actions_seen_urls_by_label.setdefault(label_key, set())
+                            seen_status_ids_for_label = self.x_actions_seen_status_ids_by_label.setdefault(label_key, set())
 
-                                new_items = [url_item for url_item in candidate_urls if url_item not in seen_for_label]
-                                if label_key == "retweets":
-                                    row_by_url = {str(r.get("url") or "").strip(): r for r in candidate_rows_unique}
-                                    new_by_status: list[str] = []
-                                    for item_url in new_items:
-                                        row = row_by_url.get(item_url) or {}
-                                        status_id = row.get("status_id")
-                                        if not isinstance(status_id, int):
-                                            status_id = self._status_id_from_url(item_url)
-                                        if isinstance(status_id, int) and status_id in seen_status_ids_for_label:
-                                            continue
-                                        new_by_status.append(item_url)
-                                    new_items = new_by_status
-
-                                    filtered_items: list[str] = []
-                                    skipped_old = 0
-                                    for item_url in new_items:
-                                        if self._is_status_already_downloaded(item_url):
-                                            skipped_old += 1
-                                            continue
-                                        filtered_items.append(item_url)
-                                    if skipped_old:
-                                        self._log(f"X monitor: retweets omitio {skipped_old} URL(s) ya descargadas en disco.")
-                                    new_items = filtered_items
-
-                                if new_items:
-                                    if label_key == "retweets":
-                                        self._log(f"X monitor: detectadas {len(new_items)} URL(s) nuevas en {label}.")
-                                    else:
-                                        self._log(f"X monitor: detectadas {len(new_items)} URL(s) nuevas con media en {label}.")
-
-                                    row_by_url = {str(r.get("url") or "").strip(): r for r in candidate_rows_unique}
-                                    for item_url in reversed(new_items):
-                                        if item_url in self.x_actions_seen_urls and label_key != "retweets":
-                                            continue
-                                        self.x_actions_seen_urls.add(item_url)
-                                        row = row_by_url.get(item_url) or {}
-                                        has_image = bool(row.get("has_image", False))
-                                        has_media = bool(row.get("has_media", False))
-                                        creator_hint = str(row.get("author_handle") or "").strip() or None
-                                        if label_key == "retweets" and not has_media:
-                                            has_media = True
-                                        self._queue_feed_download(
-                                            item_url,
-                                            prefer_image_output=has_image,
-                                            creator_hint=creator_hint,
-                                        )
-                                else:
-                                    if label_key == "retweets":
-                                        self._log(f"X monitor: sin URLs nuevas en {label}.")
-                                    else:
-                                        self._log(f"X monitor: sin URLs nuevas con media en {label}.")
-
+                            if not seen_for_label:
                                 seen_for_label.update(candidate_urls)
+                                self.x_actions_seen_urls.update(candidate_urls)
                                 if label_key == "retweets":
-                                    latest_ids = {
+                                    baseline_ids = {
                                         sid
                                         for sid in (self._status_id_from_url(url_item) for url_item in candidate_urls)
                                         if isinstance(sid, int)
                                     }
-                                    seen_status_ids_for_label.update(latest_ids)
+                                    seen_status_ids_for_label.update(baseline_ids)
+                                if label_key == "retweets":
+                                    self._log(
+                                        f"X monitor: baseline por URL cargado para {label} "
+                                        f"({len(candidate_urls)} URL(s), media={candidate_media_count})."
+                                    )
+                                else:
+                                    self._log(f"X monitor: baseline por URL cargado para {label} ({len(candidate_urls)} URL(s) con media).")
                                 continue
 
-                            if not self.x_actions_bootstrapped:
-                                urls = [str(row.get("url") or "").strip() for row in found_rows]
-                                self.x_actions_seen_urls.update([url_item for url_item in urls if url_item])
-                                self._log(f"X monitor: baseline cargado para {label} ({len(found_rows)} items).")
-                                continue
+                            new_items = [url_item for url_item in candidate_urls if url_item not in seen_for_label]
+                            if label_key == "retweets":
+                                row_by_url = {str(r.get("url") or "").strip(): r for r in candidate_rows_unique}
+                                new_by_status: list[str] = []
+                                for item_url in new_items:
+                                    row = row_by_url.get(item_url) or {}
+                                    status_id = row.get("status_id")
+                                    if not isinstance(status_id, int):
+                                        status_id = self._status_id_from_url(item_url)
+                                    if isinstance(status_id, int) and status_id in seen_status_ids_for_label:
+                                        continue
+                                    new_by_status.append(item_url)
+                                new_items = new_by_status
 
-                            urls = [str(row.get("url") or "").strip() for row in found_rows]
-                            new_items = [url_item for url_item in urls if url_item and url_item not in self.x_actions_seen_urls]
+                            filtered_items: list[str] = []
+                            skipped_old = 0
+                            for item_url in new_items:
+                                if self._is_status_already_downloaded(item_url):
+                                    skipped_old += 1
+                                    continue
+                                filtered_items.append(item_url)
+                            if skipped_old:
+                                self._log(f"X monitor: retweets omitio {skipped_old} URL(s) ya descargadas en disco.")
+                            new_items = filtered_items
+
                             if new_items:
-                                self._log(f"X monitor: detectados {len(new_items)} nuevos en {label}.")
-                            for item_url in reversed(new_items):
-                                self.x_actions_seen_urls.add(item_url)
-                                self.download_from_feed(item_url)
+                                if label_key == "retweets":
+                                    self._log(f"X monitor: detectadas {len(new_items)} URL(s) nuevas en {label}.")
+                                else:
+                                    self._log(f"X monitor: detectadas {len(new_items)} URL(s) nuevas con media en {label}.")
 
-                        self.x_actions_bootstrapped = True
+                                row_by_url = {str(r.get("url") or "").strip(): r for r in candidate_rows_unique}
+                                for item_url in reversed(new_items):
+                                    if item_url in self.x_actions_seen_urls and label_key != "retweets":
+                                        continue
+                                    self.x_actions_seen_urls.add(item_url)
+                                    row = row_by_url.get(item_url) or {}
+                                    has_video = bool(row.get("has_video", False))
+                                    has_image = bool(row.get("has_image", False))
+                                    has_media = bool(row.get("has_media", False))
+                                    creator_hint = str(row.get("author_handle") or "").strip() or None
+                                    if label_key == "retweets" and not has_media:
+                                        has_media = True
+                                    if has_video and has_image:
+                                        media_kind_hint = "carousel_video"
+                                    elif has_video:
+                                        media_kind_hint = "video"
+                                    elif has_image:
+                                        media_kind_hint = "image"
+                                    else:
+                                        media_kind_hint = ""
+                                    self._queue_feed_download(
+                                        item_url,
+                                        prefer_image_output=bool(has_image and not has_video),
+                                        creator_hint=creator_hint,
+                                        media_kind=media_kind_hint,
+                                        cookie_file_override=x_actions_cookie,
+                                    )
+                            else:
+                                if label_key == "retweets":
+                                    self._log(f"X monitor: sin URLs nuevas en {label}.")
+                                else:
+                                    self._log(f"X monitor: sin URLs nuevas con media en {label}.")
+
+                            seen_for_label.update(candidate_urls)
+                            if label_key == "retweets":
+                                latest_ids = {
+                                    sid
+                                    for sid in (self._status_id_from_url(url_item) for url_item in candidate_urls)
+                                    if isinstance(sid, int)
+                                }
+                                seen_status_ids_for_label.update(latest_ids)
+                            continue
+
+                        if not self.x_actions_bootstrapped:
+                            urls = [str(row.get("url") or "").strip() for row in found_rows]
+                            self.x_actions_seen_urls.update([url_item for url_item in urls if url_item])
+                            self._log(f"X monitor: baseline cargado para {label} ({len(found_rows)} items).")
+                            continue
+
+                        urls = [str(row.get("url") or "").strip() for row in found_rows]
+                        new_items = [url_item for url_item in urls if url_item and url_item not in self.x_actions_seen_urls]
+                        if new_items:
+                            self._log(f"X monitor: detectados {len(new_items)} nuevos en {label}.")
+                        for item_url in reversed(new_items):
+                            self.x_actions_seen_urls.add(item_url)
+                            self.download_from_feed(item_url)
+
+                    self.x_actions_bootstrapped = True
 
                 try:
                     poll_seconds = max(10.0, float((str(self.get_var("x_actions_poll_seconds_var", "45")) or "45").strip()))
@@ -2179,6 +2637,7 @@ class CoreBridge:
                 "theme_mode": theme_mode,
                 "video_output_dir": resolved_video_dir,
                 "image_output_dir": resolved_image_dir,
+                "last_pause_toggle_ts": 0.0,
                 "scraper": scraper,
             }
 
@@ -2201,6 +2660,11 @@ class CoreBridge:
         item = self._get_instance_item(instance_id)
         scraper = item.get("scraper") if item else None
         if scraper:
+            now = time.time()
+            last_toggle = float(item.get("last_pause_toggle_ts", 0.0) or 0.0)
+            if (now - last_toggle) < 0.45:
+                return
+            item["last_pause_toggle_ts"] = now
             scraper.toggle_pause()
 
     def _toggle_mute_instance(self, instance_id: int) -> None:
@@ -2435,6 +2899,14 @@ class CoreBridge:
         self.x_actions_seen_status_ids_by_label.clear()
         self.downloaded_status_ids = self._scan_downloaded_status_ids()
         self._log(f"X monitor: indice local de status descargados={len(self.downloaded_status_ids)}")
+        chosen_cookie = str(self._effective_x_actions_cookie() or "").strip()
+        if chosen_cookie:
+            if os.path.isfile(chosen_cookie):
+                self._log(f"X monitor: cookie de arranque={self._cookie_label(chosen_cookie)}")
+            else:
+                self._log(f"X monitor: cookie seleccionada no existe: {chosen_cookie}")
+        else:
+            self._log("X monitor: sin cookie seleccionada; intentara con deteccion automatica.")
         self.x_actions_bootstrapped = False
         self.x_actions_stop_event.clear()
         self.x_actions_running = True
@@ -2499,6 +2971,7 @@ class MainWindow(QMainWindow):
         self.resize(1760, 1020)
 
         self.bridge = CoreBridge()
+        self.current_media_mode = "VIDEO_AUDIO"
 
         self._ui_loading = True
         self._is_shutting_down = False
@@ -2506,6 +2979,7 @@ class MainWindow(QMainWindow):
         self._monitor_signature: tuple | None = None
         self._instances_signature: tuple | None = None
         self._combo_signatures: dict[str, tuple] = {}
+        self._cookie_pool_signature: tuple | None = None
         self._active_theme = "dark"
         self.instance_rows: dict[int, dict[str, Any]] = {}
 
@@ -3043,8 +3517,15 @@ class MainWindow(QMainWindow):
         opt = QGridLayout(options)
 
         self.max_size_edit = QLineEdit()
-        opt.addWidget(QLabel("Tamano objetivo (MB):"), 0, 0)
-        opt.addWidget(self.max_size_edit, 0, 1)
+        self.max_size_unit_combo = QComboBox()
+        self.max_size_unit_combo.addItems(["MB", "KB"])
+        
+        size_layout = QHBoxLayout()
+        size_layout.addWidget(self.max_size_edit)
+        size_layout.addWidget(self.max_size_unit_combo)
+        
+        opt.addWidget(QLabel("Tamano objetivo:"), 0, 0)
+        opt.addLayout(size_layout, 0, 1)
 
         self.start_edit = QLineEdit()
         self.end_edit = QLineEdit()
@@ -3067,39 +3548,40 @@ class MainWindow(QMainWindow):
         opt.addWidget(QLabel("Calidad audio:"), 1, 4)
         opt.addWidget(self.audio_quality_combo, 1, 5)
 
+        self.video_format_combo = QComboBox()
+        self.video_format_combo.addItems(["mp4", "mkv", "webm", "avi", "mov", "flv"])
+        self.audio_format_combo = QComboBox()
+        self.audio_format_combo.addItems(["mp3", "m4a", "opus", "wav"])
+        opt.addWidget(QLabel("Formato video:"), 2, 0)
+        opt.addWidget(self.video_format_combo, 2, 1)
+        opt.addWidget(QLabel("Formato audio:"), 2, 2)
+        opt.addWidget(self.audio_format_combo, 2, 3)
+
         self.compression_combo = QComboBox()
         self.compression_combo.addItems(["sin_compresion", "baja", "media", "alta"])
-        opt.addWidget(QLabel("Compresion:"), 2, 0)
-        opt.addWidget(self.compression_combo, 2, 1)
+        opt.addWidget(QLabel("Compresion:"), 3, 0)
+        opt.addWidget(self.compression_combo, 3, 1)
 
         self.include_subtitles_chk = QCheckBox("Descargar subtitulos")
-        self.embed_subtitles_chk = QCheckBox("Embeber subtitulos en MP4 (toggle en reproductor)")
-        opt.addWidget(self.include_subtitles_chk, 2, 2, 1, 2)
-        opt.addWidget(self.embed_subtitles_chk, 2, 4, 1, 2)
+        self.embed_subtitles_chk = QCheckBox("Embeber subtitulos en MP4")
+        opt.addWidget(self.include_subtitles_chk, 3, 2, 1, 2)
+        opt.addWidget(self.embed_subtitles_chk, 3, 4, 1, 2)
 
         self.subtitle_lang_combo = QComboBox()
-        opt.addWidget(QLabel("Idioma subtitulos:"), 3, 0)
-        opt.addWidget(self.subtitle_lang_combo, 3, 1)
+        opt.addWidget(QLabel("Idioma subtitulos:"), 4, 0)
+        opt.addWidget(self.subtitle_lang_combo, 4, 1)
         subtitle_hint = QLabel("Auto, all, idioma detectado o patron es.*/en.*")
         subtitle_hint.setObjectName("hint")
-        opt.addWidget(subtitle_hint, 3, 2, 1, 4)
+        opt.addWidget(subtitle_hint, 4, 2, 1, 4)
 
         self.use_cookies_chk = QCheckBox("Usar cookies del navegador")
         self.cookies_browser_combo = QComboBox()
         self.cookies_browser_combo.addItems(["chrome", "edge", "firefox", "brave"])
-        opt.addWidget(self.use_cookies_chk, 4, 0, 1, 2)
-        opt.addWidget(QLabel("Navegador:"), 4, 2)
-        opt.addWidget(self.cookies_browser_combo, 4, 3)
+        opt.addWidget(self.use_cookies_chk, 5, 0, 1, 2)
+        opt.addWidget(QLabel("Navegador:"), 5, 2)
+        opt.addWidget(self.cookies_browser_combo, 5, 3)
 
-        self.cookies_file_edit = QLineEdit()
         self.cookies_folder_edit = QLineEdit()
-        opt.addWidget(QLabel("cookies.txt:"), 5, 0)
-        opt.addWidget(self.cookies_file_edit, 5, 1, 1, 3)
-        btn_cookie_file = QPushButton("Elegir cookies")
-        btn_cookie_file.setObjectName("soft")
-        btn_cookie_file.clicked.connect(self._pick_cookie_file)
-        opt.addWidget(btn_cookie_file, 5, 4)
-
         opt.addWidget(QLabel("Carpeta cookies:"), 6, 0)
         opt.addWidget(self.cookies_folder_edit, 6, 1, 1, 3)
         btn_cookie_folder = QPushButton("Elegir carpeta")
@@ -3107,14 +3589,32 @@ class MainWindow(QMainWindow):
         btn_cookie_folder.clicked.connect(self._pick_cookie_folder)
         opt.addWidget(btn_cookie_folder, 6, 4)
 
+        self.cookies_pool_combo = QComboBox()
+        self.cookies_pool_combo.setEditable(False)
+        opt.addWidget(QLabel("Cookies detectadas:"), 7, 0)
+        opt.addWidget(self.cookies_pool_combo, 7, 1, 1, 3)
+        btn_cookie_refresh = QPushButton("Refrescar lista")
+        btn_cookie_refresh.setObjectName("soft")
+        btn_cookie_refresh.clicked.connect(lambda: self._refresh_cookie_pool_combo(force=True))
+        opt.addWidget(btn_cookie_refresh, 7, 4)
+
+        self.cookies_file_edit = QLineEdit()
+        self.cookies_file_edit.setReadOnly(True)
+        opt.addWidget(QLabel("Cookie activa:"), 8, 0)
+        opt.addWidget(self.cookies_file_edit, 8, 1, 1, 3)
+        btn_cookie_file = QPushButton("Elegir archivo (opcional)")
+        btn_cookie_file.setObjectName("soft")
+        btn_cookie_file.clicked.connect(self._pick_cookie_file)
+        opt.addWidget(btn_cookie_file, 8, 4)
+
         self.auto_save_chk = QCheckBox("Guardar predeterminados automaticamente")
         self.remember_pos_chk = QCheckBox("Recordar ubicacion de la ventana")
         self.start_with_windows_chk = QCheckBox("Iniciar con Windows")
         self.clipboard_monitor_chk = QCheckBox("Monitor portapapeles (auto)")
-        opt.addWidget(self.auto_save_chk, 7, 0, 1, 2)
-        opt.addWidget(self.remember_pos_chk, 7, 2, 1, 2)
-        opt.addWidget(self.start_with_windows_chk, 7, 4)
-        opt.addWidget(self.clipboard_monitor_chk, 7, 5)
+        opt.addWidget(self.auto_save_chk, 9, 0, 1, 2)
+        opt.addWidget(self.remember_pos_chk, 9, 2, 1, 2)
+        opt.addWidget(self.start_with_windows_chk, 9, 4)
+        opt.addWidget(self.clipboard_monitor_chk, 9, 5)
 
         opt.setColumnStretch(1, 1)
         opt.setColumnStretch(3, 1)
@@ -3124,28 +3624,22 @@ class MainWindow(QMainWindow):
         actions = QGroupBox("Acciones de descarga")
         act = QHBoxLayout(actions)
 
-        btn_best = QPushButton("BEST")
-        btn_best.clicked.connect(lambda: self._run_legacy("download_best"))
+        self.burger_btn = QPushButton("☰ Modo: VIDEO + AUDIO")
+        self.burger_btn.clicked.connect(self._show_media_mode_menu)
+        act.addWidget(self.burger_btn)
+
+        btn_best = QPushButton("Descargar")
+        btn_best.clicked.connect(self._action_download_best)
         act.addWidget(btn_best)
-
-        btn_audio = QPushButton("Audio")
-        btn_audio.setObjectName("soft")
-        btn_audio.clicked.connect(lambda: self._run_legacy("download_audio_only"))
-        act.addWidget(btn_audio)
-
-        btn_video = QPushButton("Solo video")
-        btn_video.setObjectName("soft")
-        btn_video.clicked.connect(lambda: self._run_legacy("download_video_only"))
-        act.addWidget(btn_video)
 
         btn_limit = QPushButton("Limitar tamano")
         btn_limit.setObjectName("soft")
-        btn_limit.clicked.connect(lambda: self._run_legacy("download_limited_size"))
+        btn_limit.clicked.connect(self._action_download_limit)
         act.addWidget(btn_limit)
 
         btn_trim = QPushButton("Recortar segmento")
         btn_trim.setObjectName("soft")
-        btn_trim.clicked.connect(lambda: self._run_legacy("download_trimmed"))
+        btn_trim.clicked.connect(self._action_download_trim)
         act.addWidget(btn_trim)
 
         btn_restart = QPushButton("Reiniciar app")
@@ -3156,6 +3650,48 @@ class MainWindow(QMainWindow):
         layout.addWidget(actions)
         layout.addStretch(1)
         return page
+
+    def _show_media_mode_menu(self) -> None:
+        menu = QMenu(self)
+
+        def set_mode(mode_name, display_name):
+            self.current_media_mode = mode_name
+            self.burger_btn.setText(f"☰ Modo: {display_name}")
+
+        act_va = menu.addAction("VIDEO + AUDIO")
+        act_va.triggered.connect(lambda: set_mode("VIDEO_AUDIO", "VIDEO + AUDIO"))
+
+        act_v = menu.addAction("VIDEO")
+        act_v.triggered.connect(lambda: set_mode("VIDEO", "VIDEO"))
+
+        act_a = menu.addAction("AUDIO")
+        act_a.triggered.connect(lambda: set_mode("AUDIO", "AUDIO"))
+
+        menu.exec_(self.burger_btn.mapToGlobal(QPoint(0, self.burger_btn.height())))
+
+    def _action_download_best(self) -> None:
+        if self.current_media_mode == "VIDEO_AUDIO":
+            self._run_legacy("download_best")
+        elif self.current_media_mode == "VIDEO":
+            self._run_legacy("download_video_only")
+        elif self.current_media_mode == "AUDIO":
+            self._run_legacy("download_audio_only")
+
+    def _action_download_limit(self) -> None:
+        if self.current_media_mode == "VIDEO_AUDIO":
+            self._run_legacy("download_limited_size")
+        elif self.current_media_mode == "VIDEO":
+            self._run_legacy("download_video_limited_size")
+        elif self.current_media_mode == "AUDIO":
+            self._run_legacy("download_audio_limited_size")
+
+    def _action_download_trim(self) -> None:
+        if self.current_media_mode == "VIDEO_AUDIO":
+            self._run_legacy("download_trimmed")
+        elif self.current_media_mode == "VIDEO":
+            self._run_legacy("download_video_trimmed")
+        elif self.current_media_mode == "AUDIO":
+            self._run_legacy("download_audio_trimmed")
 
     def _build_automation_page(self) -> QWidget:
         page, layout = self._build_scroll_page()
@@ -3239,14 +3775,25 @@ class MainWindow(QMainWindow):
         xg.addWidget(self.x_actions_retweets_chk, 1, 2)
         xg.addWidget(self.x_actions_profile_chk, 1, 3)
 
+        self.x_actions_cookie_label = QLabel("Cookie monitor X: usar global (sin cookies)")
+        self.x_actions_cookie_label.setObjectName("hint")
+
+        self.x_actions_cookie_menu_btn = QPushButton("☰")
+        self.x_actions_cookie_menu_btn.setObjectName("soft")
+        self.x_actions_cookie_menu_btn.setFixedWidth(44)
+        self.x_actions_cookie_menu_btn.clicked.connect(self._show_x_actions_cookie_menu)
+
+        xg.addWidget(self.x_actions_cookie_label, 2, 0, 1, 3)
+        xg.addWidget(self.x_actions_cookie_menu_btn, 2, 3)
+
         btn_start_x = QPushButton("Iniciar Monitor X")
         btn_start_x.clicked.connect(lambda: self._run_legacy("start_x_actions_monitor"))
         btn_stop_x = QPushButton("Detener Monitor X")
         btn_stop_x.setObjectName("danger")
         btn_stop_x.clicked.connect(lambda: self._run_legacy("stop_x_actions_monitor"))
 
-        xg.addWidget(btn_start_x, 2, 0, 1, 2)
-        xg.addWidget(btn_stop_x, 2, 2, 1, 2)
+        xg.addWidget(btn_start_x, 3, 0, 1, 2)
+        xg.addWidget(btn_stop_x, 3, 2, 1, 2)
         layout.addWidget(xmon)
 
         layout.addStretch(1)
@@ -3595,11 +4142,14 @@ class MainWindow(QMainWindow):
         self._bind_checkbox(self.x_actions_profile_chk, "x_actions_profile_var")
 
         self._bind_combo(self.compression_combo, "compression_var")
+        self._bind_combo(self.max_size_unit_combo, "max_size_unit_var")
         self._bind_combo(self.cookies_browser_combo, "cookies_browser_var")
         self._bind_combo(self.language_combo, "selected_language_var")
         self._bind_combo(self.quality_combo, "selected_quality_var")
         self._bind_combo(self.audio_quality_combo, "selected_audio_quality_var")
         self._bind_combo(self.subtitle_lang_combo, "subtitle_lang_var")
+        self._bind_combo(self.video_format_combo, "video_format_var")
+        self._bind_combo(self.audio_format_combo, "audio_format_var")
 
         lang_code = str(self.bridge.get_var("ui_language_var", "es")).strip().lower()
         self.ui_language_combo.setCurrentIndex(0 if lang_code == "es" else 1)
@@ -3613,6 +4163,9 @@ class MainWindow(QMainWindow):
         self.remember_pos_chk.toggled.connect(lambda _v: self._legacy_hook("_schedule_window_geometry_save"))
         self.start_with_windows_chk.toggled.connect(lambda _v: self._legacy_hook("_on_start_with_windows_toggle"))
         self.monitor_combo.currentIndexChanged.connect(lambda _idx: self._refresh_cookie_labels())
+        self.cookies_folder_edit.editingFinished.connect(self._on_cookie_folder_edited)
+        self.cookies_pool_combo.currentIndexChanged.connect(self._on_cookie_pool_selection_changed)
+        self._refresh_cookie_pool_combo(force=True)
 
     def _bind_line_edit(self, widget: QLineEdit, var_name: str) -> None:
         widget.setText(str(self.bridge.get_var(var_name, "")))
@@ -3672,11 +4225,58 @@ class MainWindow(QMainWindow):
             "Cookies (*.txt *.json);;Todos (*.*)",
         )
         if selected:
-            self.cookies_file_edit.setText(selected)
-            self.bridge.set_var("cookies_file_var", selected)
+            self._run_legacy("_set_cookie_file_choice", selected)
+            self._refresh_cookie_pool_combo(force=True)
 
     def _pick_cookie_folder(self) -> None:
-        self._pick_directory_for(self.cookies_folder_edit, "cookies_folder_var")
+        initial = self.cookies_folder_edit.text().strip() or os.path.dirname(os.path.abspath(__file__))
+        selected = QFileDialog.getExistingDirectory(self, "Selecciona carpeta", initial)
+        if selected:
+            self.cookies_folder_edit.setText(selected)
+            self._run_legacy("_set_cookie_folder_choice", selected)
+            self._refresh_cookie_pool_combo(force=True)
+
+    def _on_cookie_folder_edited(self) -> None:
+        folder = self.cookies_folder_edit.text().strip()
+        self._run_legacy("_set_cookie_folder_choice", folder)
+        self._refresh_cookie_pool_combo(force=True)
+
+    def _on_cookie_pool_selection_changed(self, _index: int) -> None:
+        selected = str(self.cookies_pool_combo.currentData() or "").strip()
+        if not selected:
+            return
+        self._run_legacy("_set_cookie_file_choice", selected)
+        self._refresh_cookie_pool_combo(force=True)
+
+    def _refresh_cookie_pool_combo(self, force: bool = False) -> None:
+        folder = str(self.bridge.get_var("cookies_folder_var", "") or "").strip()
+        active_cookie = str(self.bridge.get_var("cookies_file_var", "") or "").strip()
+
+        if folder and self.cookies_folder_edit.text().strip() != folder and not self.cookies_folder_edit.hasFocus():
+            self.cookies_folder_edit.setText(folder)
+        if self.cookies_file_edit.text().strip() != active_cookie:
+            self.cookies_file_edit.setText(active_cookie)
+
+        pool = [str(item).strip() for item in (self.bridge.call("_cookie_pool_files") or []) if str(item).strip()]
+        signature = (folder, tuple(pool), active_cookie)
+        if not force and signature == self._cookie_pool_signature:
+            return
+        self._cookie_pool_signature = signature
+
+        self.cookies_pool_combo.blockSignals(True)
+        self.cookies_pool_combo.clear()
+        self.cookies_pool_combo.addItem("(sin cookies detectadas)", "")
+        for path in pool:
+            label = str(self.bridge.call("_cookie_label", path))
+            self.cookies_pool_combo.addItem(label, path)
+
+        if active_cookie:
+            idx = self.cookies_pool_combo.findData(active_cookie)
+            if idx >= 0:
+                self.cookies_pool_combo.setCurrentIndex(idx)
+            else:
+                self.cookies_pool_combo.setCurrentIndex(0)
+        self.cookies_pool_combo.blockSignals(False)
 
     def _run_legacy(self, method_name: str, *args) -> None:
         try:
@@ -3746,6 +4346,26 @@ class MainWindow(QMainWindow):
 
         menu.exec_(self.global_cookie_menu_btn.mapToGlobal(QPoint(0, self.global_cookie_menu_btn.height())))
 
+    def _show_x_actions_cookie_menu(self) -> None:
+        menu = QMenu(self)
+
+        use_global = menu.addAction("Monitor X: usar cookie global")
+        use_global.triggered.connect(lambda: self._run_legacy("_set_x_actions_cookie_choice", ""))
+
+        pool = list(self.bridge.call("_cookie_pool_files") or [])
+        if pool:
+            menu.addSeparator()
+            for path in pool:
+                label = str(self.bridge.call("_cookie_label", path))
+                action = menu.addAction(label)
+                action.triggered.connect(lambda _checked=False, p=path: self._run_legacy("_set_x_actions_cookie_choice", p))
+
+        menu.addSeparator()
+        manual = menu.addAction("Elegir cookie para Monitor X...")
+        manual.triggered.connect(self._choose_x_actions_cookie)
+
+        menu.exec_(self.x_actions_cookie_menu_btn.mapToGlobal(QPoint(0, self.x_actions_cookie_menu_btn.height())))
+
     def _choose_cookie_for_monitor(self, monitor_id: int) -> None:
         initial_dir = self.cookies_folder_edit.text().strip() or os.path.dirname(os.path.abspath(__file__))
         selected, _ = QFileDialog.getOpenFileName(
@@ -3768,11 +4388,23 @@ class MainWindow(QMainWindow):
         if selected:
             self._run_legacy("_set_global_cookie_choice", selected)
 
+    def _choose_x_actions_cookie(self) -> None:
+        initial_dir = self.cookies_folder_edit.text().strip() or os.path.dirname(os.path.abspath(__file__))
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "Selecciona cookie para Monitor X",
+            initial_dir,
+            "Cookies (*.txt *.json);;Todos (*.*)",
+        )
+        if selected:
+            self._run_legacy("_set_x_actions_cookie_choice", selected)
+
     def _refresh_from_legacy(self) -> None:
         self.bridge.process_due_callbacks()
         self._append_legacy_logs()
         self._refresh_dynamic_combos()
         self._refresh_monitor_combo()
+        self._refresh_cookie_pool_combo()
         self._refresh_cookie_labels()
         self._refresh_instances_list()
 
@@ -3839,15 +4471,15 @@ class MainWindow(QMainWindow):
         combo.blockSignals(False)
 
         if target:
-            self.bridge.set_var(
-                {
-                    self.language_combo: "selected_language_var",
-                    self.quality_combo: "selected_quality_var",
-                    self.audio_quality_combo: "selected_audio_quality_var",
-                    self.subtitle_lang_combo: "subtitle_lang_var",
-                }[combo],
-                target,
-            )
+            mapping = {
+                id(self.language_combo): "selected_language_var",
+                id(self.quality_combo): "selected_quality_var",
+                id(self.audio_quality_combo): "selected_audio_quality_var",
+                id(self.subtitle_lang_combo): "subtitle_lang_var",
+            }
+            var_name = mapping.get(id(combo))
+            if var_name:
+                self.bridge.set_var(var_name, target)
 
     def _refresh_monitor_combo(self) -> None:
         monitors = list(getattr(self.bridge.app, "monitors", []))
@@ -3882,6 +4514,9 @@ class MainWindow(QMainWindow):
         global_cookie = str(self.bridge.call("_selected_global_cookie") or "")
         global_text = str(self.bridge.call("_cookie_label", global_cookie))
         self.global_cookie_label.setText(f"Cookie global: {global_text}")
+
+        x_actions_text = str(self.bridge.call("_x_actions_cookie_display") or "usar global (sin cookies)")
+        self.x_actions_cookie_label.setText(f"Cookie monitor X: {x_actions_text}")
 
     def _refresh_instances_list(self) -> None:
         app = self.bridge.app

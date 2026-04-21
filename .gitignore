@@ -1,59 +1,30 @@
-# Python
+# Python cache
 __pycache__/
-*.py[cod]
-*$py.class
+*.pyc
+*.pyo
 
-# Virtual environments
+# Virtual envs
 .venv/
 venv/
-env/
-ENV/
 
-# Caches / test artifacts
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-.coverage.*
-htmlcov/
-
-# IDE / OS
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-
-# Logs / temp
-*.log
-*.tmp
-*.temp
+# Runtime artifacts
 activity.log
 
-# Local secrets / env
-.env
-.env.*
-*.key
-*.pem
+# Local settings / state
+downloader_settings.json
+with_replies_probe.txt
 
-# Runtime browser profiles
+# Output folders
+images/
+videos/
+
+# Browser state used by Playwright
 browser_profile/
 browser_profiles/
 
-# Test / debug probe files
-*_probe.txt
-with_replies_probe.txt
-LEGACY_PARITY_AUDIT.md
-
-# Cookies and private session artifacts
+# Cookies and local private files
 cookies/
-cookies/*.txt
-cookies/*.json
 
-# Runtime state/cache
-feed_metadata/
-downloader_settings.json
-
-# Optional local outputs inside downloader
-images/
-videos/
-output/
+# OS noise
+.DS_Store
+Thumbs.db
