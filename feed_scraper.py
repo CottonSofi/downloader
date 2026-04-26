@@ -3,6 +3,7 @@ import threading
 import time
 import json
 import re
+from collections import deque
 from enum import Enum
 from typing import Callable
 
@@ -90,6 +91,10 @@ class FeedScraper:
     self._pause_toggle_lock = threading.Lock()
     self._last_pause_toggle_ts = 0.0
     self._pause_toggle_cooldown_seconds = 0.45
+    self._twitter_recent_items: deque[dict] = deque(maxlen=100)
+    self._twitter_recent_cursor = -1
+    self._twitter_last_seen_url = ""
+    self._twitter_same_url_cycles = 0
 
   def _normalize_color_scheme(self, value: str) -> str:
     clean = str(value or "").strip().lower()
@@ -287,6 +292,7 @@ class FeedScraper:
     self._action_like_event.clear()
     self._action_retweet_event.clear()
     self._twitter_focus_status_id = ""
+    self._reset_twitter_recent_state()
     try:
       if self._runtime_context is not None:
         self._runtime_context.close()
@@ -334,6 +340,7 @@ class FeedScraper:
     self._action_like_event.clear()
     self._action_retweet_event.clear()
     self._twitter_focus_status_id = ""
+    self._reset_twitter_recent_state()
     selected = Platform.parse(platform)
     self._thread = threading.Thread(target=self._run, args=(selected,), daemon=True)
     self._thread.start()
@@ -348,8 +355,16 @@ class FeedScraper:
     self._action_like_event.clear()
     self._action_retweet_event.clear()
     self._twitter_focus_status_id = ""
+    self._reset_twitter_recent_state()
     if self._thread and self._thread.is_alive():
       self._thread.join(timeout=5)
+
+  def _reset_twitter_recent_state(self) -> None:
+    with self._state_lock:
+      self._twitter_recent_items.clear()
+      self._twitter_recent_cursor = -1
+      self._twitter_last_seen_url = ""
+      self._twitter_same_url_cycles = 0
 
   def _wait_if_paused(self, page=None) -> bool:
     while self._pause_event.is_set() and not self._stop_event.is_set() and not self._kill_event.is_set():
@@ -592,6 +607,88 @@ class FeedScraper:
     if not match:
       return ""
     return str(match.group(1) or "").strip()
+
+  def _register_twitter_recent_item(self, item: dict | None) -> None:
+    if not isinstance(item, dict):
+      return
+    url = str(item.get("url") or "").strip()
+    if not url:
+      return
+
+    entry = {
+      "url": url,
+      "status_id": self._status_id_from_url(url),
+      "abs_top": float(item.get("abs_top") or 0.0),
+      "height": float(item.get("height") or 0.0),
+      "ts": time.time(),
+    }
+
+    with self._state_lock:
+      if 0 <= self._twitter_recent_cursor < len(self._twitter_recent_items):
+        cursor_item = self._twitter_recent_items[self._twitter_recent_cursor]
+        if str(cursor_item.get("url") or "").strip() == url:
+          self._twitter_recent_items[self._twitter_recent_cursor] = entry
+          return
+
+      if self._twitter_recent_items and str(self._twitter_recent_items[-1].get("url") or "").strip() == url:
+        self._twitter_recent_items[-1] = entry
+        self._twitter_recent_cursor = len(self._twitter_recent_items) - 1
+        return
+
+      self._twitter_recent_items.append(entry)
+      self._twitter_recent_cursor = len(self._twitter_recent_items) - 1
+
+  def _history_prev_twitter_item(self) -> dict | None:
+    with self._state_lock:
+      total = len(self._twitter_recent_items)
+      if total < 2:
+        return None
+
+      if self._twitter_recent_cursor < 0 or self._twitter_recent_cursor >= total:
+        self._twitter_recent_cursor = total - 1
+
+      target_idx = self._twitter_recent_cursor - 1
+      if target_idx < 0:
+        return None
+
+      self._twitter_recent_cursor = target_idx
+      picked = dict(self._twitter_recent_items[target_idx])
+
+    self._log(f"PREV history: idx={target_idx + 1}/{total} url={picked.get('url')}")
+    return picked
+
+  def _scroll_to_abs_y(self, page, target_abs_y: float) -> None:
+    page.evaluate(
+      """
+      ({ target }) => {
+        const y = Math.max(0, Number(target || 0));
+        window.scrollTo({ top: y, left: 0, behavior: 'auto' });
+      }
+      """,
+      {"target": float(target_abs_y)},
+    )
+
+  def _navigate_prev_from_recent_items(self, page) -> dict | None:
+    target = self._history_prev_twitter_item()
+    if not target:
+      return None
+
+    try:
+      target_abs = float(target.get("abs_top") or 0.0)
+    except Exception:
+      target_abs = 0.0
+    try:
+      target_h = float(target.get("height") or 0.0)
+    except Exception:
+      target_h = 0.0
+
+    desired = max(0.0, target_abs - max(100.0, target_h * 0.35))
+    self._scroll_to_abs_y(page, desired)
+    settle = self._wait_with_interrupt(max(0.14, self.scroll_pause_seconds * 0.35), page)
+    if settle == "stop":
+      return None
+
+    return target
 
   def _resolve_action_target_status_id(self, page) -> str:
     page_url = ""
@@ -855,7 +952,6 @@ class FeedScraper:
     return "target page, context or browser has been closed" in text or "has been closed" in text
 
   def _existing_cookie_files(self) -> list[str]:
-    import random
     if self.cookie_candidates:
       unique_selected: list[str] = []
       seen_selected: set[str] = set()
@@ -871,13 +967,16 @@ class FeedScraper:
       return unique_selected
 
     root_dir = os.path.dirname(os.path.dirname(__file__))
+    module_dir = os.path.dirname(os.path.abspath(__file__))
     manual = (self.cookies_file or "").strip()
 
     dirs_to_scan = [
+      module_dir,
+      os.path.join(module_dir, "cookies"),
       os.path.join(root_dir, "downloader", "cookies"),
       os.path.join(root_dir, "cookies"),
       os.path.join(root_dir, "downloader"),
-      root_dir
+      root_dir,
     ]
 
     out: list[str] = []
@@ -895,25 +994,23 @@ class FeedScraper:
       add_file(manual)
 
     for d in dirs_to_scan:
-      if not os.path.isdir(d):
+      clean_dir = (d or "").strip()
+      if not clean_dir or not os.path.isdir(clean_dir):
         continue
       try:
-        for f in os.listdir(d):
-          if f.lower().endswith(".txt") or f.lower().endswith(".json"):
-            if "cookie" in f.lower():
-              add_file(os.path.join(d, f))
+        for dirpath, _dirnames, filenames in os.walk(clean_dir):
+          for f in filenames:
+            lower = f.lower()
+            if not (lower.endswith(".txt") or lower.endswith(".json")):
+              continue
+            full_path = os.path.join(dirpath, f)
+            normalized = full_path.replace("\\", "/").lower()
+            if "cookie" in lower or "/cookies/" in normalized:
+              add_file(full_path)
       except Exception:
         pass
 
-    if out:
-      first = out[0]
-      tail = out[1:]
-      random.shuffle(tail)
-
-      final_list = [first] + tail
-      return final_list
-
-    return []
+    return out
 
   def _load_netscape_cookies(self, file_path: str) -> list[dict]:
     cookies: list[dict] = []
@@ -1276,6 +1373,26 @@ class FeedScraper:
         self._scroll_by(page, min(260, max(120, int(self.scroll_px * 0.25))))
         wait_result = self._wait_with_interrupt(self.scroll_pause_seconds, page)
         if wait_result == "stop":
+          return
+        continue
+
+      self._register_twitter_recent_item(current)
+
+      if current_url == self._twitter_last_seen_url:
+        self._twitter_same_url_cycles += 1
+      else:
+        self._twitter_last_seen_url = current_url
+        self._twitter_same_url_cycles = 0
+
+      if (
+        not force_prev_pick
+        and current_url in self._seen_urls
+        and self._twitter_same_url_cycles >= 3
+      ):
+        self._log(f"Feed Twitter: anti-atasco activado, forzando avance desde {current_url}")
+        self._safe_scroll_down(page, min(520, max(220, int(self.scroll_px * 0.65))))
+        settle = self._wait_with_interrupt(max(0.2, min(0.8, self.scroll_pause_seconds * 0.6)), page)
+        if settle == "stop":
           return
         continue
 
@@ -1675,6 +1792,7 @@ class FeedScraper:
             creator_hint: null,
             top: rect.top,
             abs_top: absTop,
+            height: rect.height,
             center: rect.top + rect.height / 2,
             has_video: hasVideo,
             has_image: hasImage,
@@ -1741,6 +1859,10 @@ class FeedScraper:
     )
 
   def _navigate_prev_to_previous_item(self, page) -> dict | None:
+    recent_target = self._navigate_prev_from_recent_items(page)
+    if recent_target:
+      return recent_target
+
     focus_url = str(self._twitter_focus_status_id or "").strip()
     anchor_abs_top = self._twitter_item_abs_top(page, focus_url) if focus_url else None
     step_scroll = min(520, max(220, int(self.scroll_px * 0.6)))
@@ -3109,6 +3231,7 @@ class FeedScraper:
       """
       ({ currentUrl, currentAbsTop }) => {
         const vh = window.innerHeight || document.documentElement.clientHeight;
+        const beforeY = Number(window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0);
         const articles = Array.from(document.querySelectorAll('article'));
         const canonical = (href) => {
           if (!href) return null;
@@ -3143,7 +3266,8 @@ class FeedScraper:
         const delta = next.center - (vh / 2);
         const step = Math.max(-40, Math.min(280, delta));
         window.scrollBy({ top: step, left: 0, behavior: 'auto' });
-        return true;
+        const afterY = Number(window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0);
+        return Math.abs(afterY - beforeY) > 1 || Math.abs(delta) > 18;
       }
       """,
       {"currentUrl": current_url, "currentAbsTop": float(current_abs_top)},

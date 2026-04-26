@@ -532,38 +532,50 @@ class DownloaderApp:
     return candidates[0]
 
   def _cookie_pool_files(self) -> list[str]:
-    manual = (self.cookies_file_var.get() or "").strip()
+    files = self._existing_cookie_files()
+    if files:
+      return files
+
     folder = (self.cookies_folder_var.get() or "").strip()
     if not folder:
       folder = self._cookie_pool_default_dir()
       self.cookies_folder_var.set(folder)
 
     out: list[str] = []
-    seen: set[str] = set()
-
-    def add_file(path: str) -> None:
-      clean = (path or "").strip()
-      if not clean or not os.path.isfile(clean):
-        return
-      key = os.path.normcase(os.path.abspath(clean))
-      if key in seen:
-        return
-      seen.add(key)
-      out.append(clean)
-
-    if manual:
-      add_file(manual)
-
     if os.path.isdir(folder):
       try:
-        for name in sorted(os.listdir(folder), key=lambda item: item.lower()):
-          lower = name.lower()
-          if (lower.endswith(".txt") or lower.endswith(".json")) and "cookie" in lower:
-            add_file(os.path.join(folder, name))
+        for dirpath, _dirnames, filenames in os.walk(folder):
+          for name in filenames:
+            lower = name.lower()
+            if lower.endswith(".txt") or lower.endswith(".json"):
+              out.append(os.path.join(dirpath, name))
       except Exception:
         pass
 
-    return out
+    unique = sorted({os.path.abspath(item) for item in out})
+    return unique
+
+  def _normalize_cookie_pool_root_from_path(self, path: str) -> str:
+    clean = (path or "").strip()
+    if not clean:
+      return ""
+
+    folder = clean
+    if os.path.isfile(clean):
+      folder = os.path.dirname(clean)
+    if not folder:
+      return ""
+
+    current = os.path.abspath(folder)
+    while True:
+      name = os.path.basename(current).strip().lower()
+      if name in {"cookies", "cookie"}:
+        return current
+      parent = os.path.dirname(current)
+      if not parent or parent == current:
+        break
+      current = parent
+    return os.path.abspath(folder)
 
   def pick_cookies_folder(self) -> None:
     initial = (self.cookies_folder_var.get() or "").strip() or self._cookie_pool_default_dir()
@@ -3579,7 +3591,9 @@ class DownloaderApp:
     )
     if selected:
       self.cookies_file_var.set(selected)
-      self.cookies_folder_var.set(os.path.dirname(selected))
+      normalized_folder = self._normalize_cookie_pool_root_from_path(selected)
+      if normalized_folder:
+        self.cookies_folder_var.set(normalized_folder)
 
   def _auto_load_default_cookies_file(self) -> None:
     if not (self.cookies_folder_var.get() or "").strip():
@@ -3632,10 +3646,15 @@ class DownloaderApp:
       if not clean_dir or not os.path.isdir(clean_dir):
         continue
       try:
-        for f in sorted(os.listdir(clean_dir), key=lambda item: item.lower()):
-          lower = f.lower()
-          if lower.endswith(".txt") and "cookie" in lower:
-            add_file(os.path.join(clean_dir, f))
+        for dirpath, _dirnames, filenames in os.walk(clean_dir):
+          for f in filenames:
+            lower = f.lower()
+            if not (lower.endswith(".txt") or lower.endswith(".json")):
+              continue
+            full_path = os.path.join(dirpath, f)
+            normalized = full_path.replace("\\", "/").lower()
+            if "cookie" in lower or "/cookies/" in normalized:
+              add_file(full_path)
       except Exception:
         pass
 

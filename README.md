@@ -43,3 +43,20 @@ Si se usa Playwright en otras apps del modulo:
 ```bash
 playwright install chromium
 ```
+
+## Notas de mantenimiento (2026-04-22)
+
+- Se corrigio la cadencia del Monitor X para respetar el intervalo configurado entre revisiones.
+- Se corrigio un bug de flujo en el monitor que podia repetir baseline en cada vuelta.
+- Se reforzo el worker de feed para X con fallbacks de descarga cuando yt-dlp falla en GraphQL.
+- Se mejoro la deteccion de cookies tras mover el proyecto:
+	- El pool de cookies ya no queda limitado a una subcarpeta social (por ejemplo `cookies/tiktok`).
+	- Al seleccionar una cookie puntual, la carpeta se normaliza al raiz `cookies` cuando aplica.
+	- Se amplio el escaneo recursivo de cookies en `app.py`, `downloader.py`, `app_oldgui.py` y `feed_scraper.py`.
+
+	## Notas de mantenimiento (2026-04-23)
+
+	- Feed X: la rama de descarga preferente de imagen tambien activa fallback estricto para status de Twitter/X cuando yt-dlp falla (incluye ruta GraphQL).
+	- Feed X: se agrego un guard anti-atasco para evitar quedarse ciclando en el mismo post tras carrusel/imagen.
+	- PREV en feed item-por-item: ahora usa un buffer temporal en memoria (100 posts recientes con geometria basica) para retroceso mas estable.
+	- El buffer temporal de PREV se limpia al iniciar/detener/cerrar instancia (no persiste entre sesiones).

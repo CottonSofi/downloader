@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import queue
 import re
@@ -60,8 +61,10 @@ class CoreBridge:
         self._shutdown = False
         self._log_lock = threading.Lock()
         self._workers_lock = threading.Lock()
-        self._settings_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloader_settings.json")
-        self.log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "activity.log")
+        self._base_dir = os.path.dirname(os.path.abspath(__file__))
+        self._message_root = os.path.dirname(self._base_dir)
+        self._settings_path = os.path.join(self._base_dir, "downloader_settings.json")
+        self.log_file_path = os.path.join(self._base_dir, "activity.log")
         self.log_history: list[str] = []
 
         self.available_languages = ["auto"]
@@ -146,6 +149,11 @@ class CoreBridge:
         self._prepare_log_file()
         self._load_persisted_settings()
         self._load_start_with_windows_state()
+        if bool(self.get_var("start_with_windows_var", False)):
+            try:
+                self._set_start_with_windows_enabled(True)
+            except Exception as exc:
+                self._log(f"WARN actualizando inicio con Windows: {exc}")
         self.monitors = self._detect_monitors()
         self._last_monitors_signature = tuple(self._monitor_identity(item) for item in self.monitors)
         self._ensure_default_paths()
@@ -177,15 +185,74 @@ class CoreBridge:
                 pass
 
     def _ensure_default_paths(self) -> None:
-        base_dir = os.path.dirname(os.path.abspath(__file__))
+        base_dir = self._base_dir
         if not str(self.get_var("output_dir_var", "")).strip():
             self.set_var("output_dir_var", os.path.join(base_dir, "videos"))
         if not str(self.get_var("image_output_dir_var", "")).strip():
             self.set_var("image_output_dir_var", os.path.join(base_dir, "images"))
         if not str(self.get_var("cookies_folder_var", "")).strip():
             self.set_var("cookies_folder_var", os.path.join(base_dir, "cookies"))
-        os.makedirs(str(self.get_var("output_dir_var", "")).strip(), exist_ok=True)
-        os.makedirs(str(self.get_var("image_output_dir_var", "")).strip(), exist_ok=True)
+        for key, rel_fallback in (("output_dir_var", "videos"), ("image_output_dir_var", "images"), ("cookies_folder_var", "cookies")):
+            current = str(self.get_var(key, "") or "").strip()
+            target = current or os.path.join(base_dir, rel_fallback)
+            try:
+                os.makedirs(target, exist_ok=True)
+                self.set_var(key, os.path.abspath(target))
+            except Exception:
+                fallback = os.path.join(base_dir, rel_fallback)
+                try:
+                    os.makedirs(fallback, exist_ok=True)
+                    self.set_var(key, os.path.abspath(fallback))
+                except Exception:
+                    pass
+
+    def _relocate_legacy_path(self, raw_path: str) -> str:
+        clean = str(raw_path or "").strip()
+        if not clean:
+            return ""
+
+        if not os.path.isabs(clean):
+            return os.path.abspath(os.path.join(self._base_dir, clean))
+
+        norm = clean.replace("\\", "/")
+        norm_lower = norm.lower()
+        mappings = [
+            ("/message/downloader/", self._base_dir),
+            ("/message/", self._message_root),
+            ("/downloader/", self._base_dir),
+        ]
+        for marker, target_root in mappings:
+            idx = norm_lower.find(marker)
+            if idx == -1:
+                continue
+            suffix = norm[idx + len(marker):].strip("/")
+            if not suffix:
+                return os.path.abspath(target_root)
+            candidate = os.path.join(target_root, *suffix.split("/"))
+            return os.path.abspath(candidate)
+
+        return os.path.abspath(clean)
+
+    def _migrate_loaded_paths(self) -> None:
+        defaults = {
+            "output_dir_var": os.path.join(self._base_dir, "videos"),
+            "image_output_dir_var": os.path.join(self._base_dir, "images"),
+            "cookies_folder_var": os.path.join(self._base_dir, "cookies"),
+        }
+
+        for key, fallback in defaults.items():
+            current = str(self._vars.get(key, "") or "").strip()
+            candidate = self._relocate_legacy_path(current) if current else os.path.abspath(fallback)
+            try:
+                os.makedirs(candidate, exist_ok=True)
+                self._vars[key] = os.path.abspath(candidate)
+            except Exception:
+                self._vars[key] = os.path.abspath(fallback)
+
+        cookie_file = str(self._vars.get("cookies_file_var", "") or "").strip()
+        if cookie_file:
+            relocated = self._relocate_legacy_path(cookie_file)
+            self._vars["cookies_file_var"] = relocated if os.path.isfile(relocated) else ""
 
     def _settings_payload(self) -> dict[str, Any]:
         keys = [
@@ -244,6 +311,7 @@ class CoreBridge:
                 for key, value in payload.items():
                     if key in self._vars:
                         self._vars[key] = value
+            self._migrate_loaded_paths()
         except Exception as exc:
             self._log(f"WARN cargando settings: {exc}")
 
@@ -252,26 +320,49 @@ class CoreBridge:
         startup_dir = os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs", "Startup")
         return os.path.join(startup_dir, "downloader_app_autostart.vbs")
 
+    def _startup_vbs_legacy_paths(self) -> list[str]:
+        startup_path = self._startup_vbs_path()
+        startup_dir = os.path.dirname(startup_path)
+        return [
+            startup_path,
+            os.path.join(startup_dir, "app_autostart.vbs"),
+        ]
+
+    def _cleanup_legacy_startup_entries(self, keep_canonical: bool = False) -> None:
+        canonical = os.path.normcase(os.path.abspath(self._startup_vbs_path()))
+        for candidate in self._startup_vbs_legacy_paths():
+            try:
+                candidate_abs = os.path.normcase(os.path.abspath(candidate))
+                if keep_canonical and candidate_abs == canonical:
+                    continue
+                if os.path.isfile(candidate):
+                    os.remove(candidate)
+            except Exception:
+                continue
+
     def _set_start_with_windows_enabled(self, enabled: bool) -> None:
         startup_path = self._startup_vbs_path()
         startup_dir = os.path.dirname(startup_path)
         if enabled:
             os.makedirs(startup_dir, exist_ok=True)
+            self._cleanup_legacy_startup_entries(keep_canonical=True)
             python_exe = sys.executable
             script_path = os.path.abspath(__file__)
             content = (
                 'Set shell = CreateObject("WScript.Shell")\n'
-                f'shell.Run Chr(34) & "{python_exe}" & Chr(34) & " " & Chr(34) & "{script_path}" & Chr(34), 0, False\n'
+                'Set fso = CreateObject("Scripting.FileSystemObject")\n'
+                f'If fso.FileExists("{python_exe}") And fso.FileExists("{script_path}") Then shell.Run Chr(34) & "{python_exe}" & Chr(34) & " " & Chr(34) & "{script_path}" & Chr(34), 0, False\n'
             )
             with open(startup_path, "w", encoding="utf-8", errors="replace") as f:
                 f.write(content)
             return
-        if os.path.isfile(startup_path):
-            os.remove(startup_path)
+        self._cleanup_legacy_startup_entries(keep_canonical=False)
 
     def _load_start_with_windows_state(self) -> None:
         try:
-            self._vars["start_with_windows_var"] = bool(os.path.isfile(self._startup_vbs_path()))
+            self._vars["start_with_windows_var"] = any(
+                os.path.isfile(path) for path in self._startup_vbs_legacy_paths()
+            )
         except Exception:
             self._vars["start_with_windows_var"] = False
 
@@ -1237,6 +1328,11 @@ class CoreBridge:
         threading.Thread(target=worker, daemon=True).start()
 
     def _cookie_pool_files(self) -> list[str]:
+        # Build the picker from all known cookie roots, not only the currently selected subfolder.
+        files = self._existing_cookie_files()
+        if files:
+            return files
+
         folder = str(self.get_var("cookies_folder_var", "")).strip()
         if not folder:
             folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies")
@@ -1298,7 +1394,7 @@ class CoreBridge:
         clean_folder = str(folder or "").strip()
         self.set_var("cookies_folder_var", clean_folder)
 
-        pool = self._scan_cookie_files_in_folder(clean_folder, recursive=True)
+        pool = self._existing_cookie_files()
         current = str(self.get_var("cookies_file_var", "") or "").strip()
         current_key = os.path.normcase(os.path.abspath(current)) if current and os.path.isfile(current) else ""
         pool_keys = {os.path.normcase(os.path.abspath(path)) for path in pool}
@@ -1317,11 +1413,33 @@ class CoreBridge:
         else:
             self._log("No se encontraron cookies en la carpeta seleccionada")
 
+    def _normalize_cookie_pool_root_from_path(self, path: str) -> str:
+        clean = str(path or "").strip()
+        if not clean:
+            return ""
+
+        folder = clean
+        if os.path.isfile(clean):
+            folder = os.path.dirname(clean)
+        if not folder:
+            return ""
+
+        current = os.path.abspath(folder)
+        while True:
+            name = os.path.basename(current).strip().lower()
+            if name in {"cookies", "cookie"}:
+                return current
+            parent = os.path.dirname(current)
+            if not parent or parent == current:
+                break
+            current = parent
+        return os.path.abspath(folder)
+
     def _set_cookie_file_choice(self, path: str) -> None:
         clean = str(path or "").strip()
         self.set_var("cookies_file_var", clean)
         if clean and os.path.isfile(clean):
-            folder = os.path.dirname(clean)
+            folder = self._normalize_cookie_pool_root_from_path(clean)
             if folder:
                 self.set_var("cookies_folder_var", folder)
             self._log(f"Cookie activa: {self._cookie_label(clean)}")
@@ -2195,31 +2313,43 @@ class CoreBridge:
                                     seen_status_ids_for_label.update(latest_ids)
                                 continue
 
-                            if not self.x_actions_bootstrapped:
-                                urls = [str(row.get("url") or "").strip() for row in found_rows]
-                                self.x_actions_seen_urls.update([url_item for url_item in urls if url_item])
-                                self._log(f"X monitor: baseline cargado para {label} ({len(found_rows)} items).")
-                                continue
+                                if not self.x_actions_bootstrapped:
+                                    urls = [str(row.get("url") or "").strip() for row in found_rows]
+                                    self.x_actions_seen_urls.update([url_item for url_item in urls if url_item])
+                                    self._log(f"X monitor: baseline cargado para {label} ({len(found_rows)} items).")
+                                    continue
 
-                            urls = [str(row.get("url") or "").strip() for row in found_rows]
-                            new_items = [url_item for url_item in urls if url_item and url_item not in self.x_actions_seen_urls]
-                            if new_items:
-                                self._log(f"X monitor: detectados {len(new_items)} nuevos en {label}.")
-                            for item_url in reversed(new_items):
-                                self.x_actions_seen_urls.add(item_url)
-                                self.download_from_feed(item_url)
+                                urls = [str(row.get("url") or "").strip() for row in found_rows]
+                                new_items = [url_item for url_item in urls if url_item and url_item not in self.x_actions_seen_urls]
+                                if new_items:
+                                    self._log(f"X monitor: detectados {len(new_items)} nuevos en {label}.")
+                                for item_url in reversed(new_items):
+                                    self.x_actions_seen_urls.add(item_url)
+                                    self.download_from_feed(item_url)
 
                         self.x_actions_bootstrapped = True
 
                 try:
-                    poll_seconds = max(10.0, float((str(self.get_var("x_actions_poll_seconds_var", "45")) or "45").strip()))
+                    poll_seconds = float((str(self.get_var("x_actions_poll_seconds_var", "45")) or "45").strip())
+                    if not math.isfinite(poll_seconds):
+                        raise ValueError("poll_seconds no finito")
                 except Exception:
                     poll_seconds = 45.0
-                self.x_actions_stop_event.wait(poll_seconds)
+                self._wait_x_actions_poll_interval(max(10.0, poll_seconds))
         finally:
             self._log("X monitor invisible: detenido")
             self.x_actions_running = False
             self.x_actions_thread = None
+
+    def _wait_x_actions_poll_interval(self, poll_seconds: float) -> None:
+        # Monotonic fallback: even if Event.wait wakes early, enforce the configured cadence.
+        target_seconds = max(0.2, float(poll_seconds))
+        deadline = time.monotonic() + target_seconds
+        while not self.x_actions_stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            self.x_actions_stop_event.wait(min(0.5, remaining))
 
     def _monitor_label(self, monitor_id: int) -> str:
         for monitor in self.monitors:
